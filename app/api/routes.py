@@ -146,9 +146,12 @@ def _scan_stream_usage(chunk: bytes, ti: int, to: int) -> tuple[int, int]:
 
 @router.get("/v1/stats")
 async def stats(request: Request, _key: str = Depends(_require_key)):
-    """用量统计（需有效 API key）。"""
+    """用量 + 代理池水位统计（需有效 API key）。"""
     usage: UsageTracker = request.app.state.usage
-    return usage.stats()
+    client: UpstreamClient = request.app.state.upstream
+    data = usage.stats()
+    data["pool"] = client.pool.metrics()
+    return data
 
 
 @router.get("/health")

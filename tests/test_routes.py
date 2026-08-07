@@ -230,3 +230,6 @@ async def test_stats_tracks_usage():
     assert data["totals"]["tokens_in"] == 10
     assert data["totals"]["tokens_out"] == 5
     assert data["per_key"]["sk-alice"]["requests"] == 1
+    assert "pool" in data
+    assert "available" in data["pool"]
+    assert data["pool"]["refill_count"] >= 1

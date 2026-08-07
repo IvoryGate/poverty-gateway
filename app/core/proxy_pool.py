@@ -44,6 +44,14 @@ class ProxyPool:
         self._cooldown: dict[str, dict] = {}    # proxy -> {"until": ts, "strike": n}
         self._warm = False                      # 是否已做过首次补池
 
+        # 观测指标
+        self._metrics = {
+            "refill_count": 0,       # 补池次数
+            "cooldown_reports": 0,   # 真实请求 429 回写次数
+            "dead_reports": 0,       # 真实请求连接失败回写次数
+            "no_proxy_errors": 0,    # 取号失败次数
+        }
+
     # ---------- 对外接口 ----------
 
     async def get_proxy(self, exclude: set[str] | None = None) -> str:
@@ -58,6 +66,7 @@ class ProxyPool:
             if not self._warm or self._low_water():
                 await self._refill()
             if not self._available:
+                self._metrics["no_proxy_errors"] += 1
                 raise NoProxyAvailable("代理池无可用代理")
             candidates = [
                 p for p in self._available
@@ -70,6 +79,7 @@ class ProxyPool:
                 # exclude 排除了全部：池子太小，退回全部可用池挑最空闲
                 candidates = list(self._available)
             if not candidates:
+                self._metrics["no_proxy_errors"] += 1
                 raise NoProxyAvailable("代理池无可用代理（全部被排除）")
             pick = min(candidates, key=lambda p: self._in_flight.get(p, 0))
             self._in_flight[pick] = self._in_flight.get(pick, 0) + 1
@@ -98,10 +108,26 @@ class ProxyPool:
                 elif proxy not in self._available:
                     self._available[proxy] = {"quality": ""}
             elif status == COOLDOWN:
+                self._metrics["cooldown_reports"] += 1
                 self._mark_cooldown(proxy)
             elif status == DEAD:
+                self._metrics["dead_reports"] += 1
                 self._available.pop(proxy, None)
                 self._cooldown.pop(proxy, None)
+
+    def metrics(self) -> dict:
+        """代理池水位与健康指标（快照）。"""
+        return {
+            "available": len(self._available),
+            "in_flight": sum(self._in_flight.values()),
+            "cooldown": len(self._cooldown),
+            "target": self.settings.pool_target,
+            "low_water": self.settings.pool_low_water,
+            "refill_count": self._metrics["refill_count"],
+            "cooldown_reports": self._metrics["cooldown_reports"],
+            "dead_reports": self._metrics["dead_reports"],
+            "no_proxy_errors": self._metrics["no_proxy_errors"],
+        }
 
     # ---------- 池子维护 ----------
 
@@ -137,6 +163,7 @@ class ProxyPool:
         探测并发严格限制为 1-2，防止打爆免费额度/自我限流。
         """
         self._warm = True
+        self._metrics["refill_count"] += 1
         chain = self.settings.quality_chain
         probe_conc = min(self.settings.probe_concurrency, 2)
         for quality in chain:
