@@ -9,7 +9,9 @@
 > 冷却指数退避（60s×2ⁿ，上限 10min）+ in-flight 并发控制（避免多 key 撞同一 IP）。
 > HTTPS 上线：nginx 反代 `https://api.pixelreeds.com` + 通配证书，网关只监听 127.0.0.1，
 > systemd 托管（开机自启 + 崩溃自愈）。
-> 实测：三个模型经域名 HTTPS 全通，12 测试通过 + ruff 全过。
+> SSE 流式透传：stream=true 逐块转发（nginx 关缓冲 + httpx 流式读取），
+> 首块前可重试、出流后透传中断；deepseek/mimo/longcat 实测正常流式。
+> 实测：三个模型经域名 HTTPS 全通，17 测试通过 + ruff 全过。
 
 ## 阶段总览
 

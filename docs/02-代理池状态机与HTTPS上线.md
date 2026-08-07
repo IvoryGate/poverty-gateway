@@ -66,6 +66,25 @@
 - 网关改为**只监听 127.0.0.1**，仅经 nginx 出入，杜绝裸奔公网直连
 - systemd 托管 `poverty-gateway.service`：开机自启 + `Restart=always` 崩溃自愈
 
+### 5. SSE 流式透传
+
+- `UpstreamClient.chat_stream()`：`httpx` 流式读取上游 SSE，逐块产出原始字节
+  - **首个块到达前**可换代理重试（429/5xx/连接失败），逻辑与非流式一致
+  - **开始出流后**中途失败只能透传中断（响应头已定，无法重试），标记状态后抛
+  - 流结束后 `report(proxy, OK)` 回写（不提前释放 in-flight）
+  - 流式用独立超时：`Timeout(connect=15, read=300, write=30, pool=15)`
+- 路由 `stream=true` → `StreamingResponse(media_type="text/event-stream")`
+  - 错误统一编码为 SSE `data: {error}` 事件（兼容 OpenAI 客户端解析）
+  - `Cache-Control: no-cache` + `X-Accel-Buffering: no`
+- nginx 加 `proxy_buffering off; proxy_cache off;`——**关键**，否则 nginx 攒块后
+  再发，首字延迟全被吃掉
+
+实测（经 https://api.pixelreeds.com，stream=true）：
+- deepseek/mimo/longcat 均正常流式出字
+- 216 数据块 + `[DONE]` 收尾，content 逐块拼接完整
+- 注意：free 模型带 reasoning_content（常占大量 token），max_tokens 给小 content
+  会为空，属正常现象
+
 ## 技术决策及理由
 
 | 决策 | 理由 |
@@ -93,7 +112,7 @@ sudo systemctl enable poverty-gateway
 sudo systemctl start poverty-gateway
 
 # 测试
-python -m pytest   # 12 passed
+python -m pytest   # 17 passed
 ruff check .       # clean
 curl https://api.pixelreeds.com/v1/models
 ```

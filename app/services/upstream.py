@@ -67,6 +67,67 @@ class UpstreamClient:
                 continue
         raise last_err or UpstreamError("no proxy retries left")
 
+    async def chat_stream(self, public_model: str, payload: dict):
+        """转发一次 chat completion（流式 SSE），逐块产出原始字节。
+
+        返回异步生成器：每项是一块上游返回的原始字节（SSE 格式）。
+        限流/5xx/连接失败在**首个块到达前**可换代理重试；
+        一旦开始出流，错误只能透传/中断（响应头已定，无法重试）。
+        """
+        upstream_model = self.models.to_upstream(public_model)
+        payload = dict(payload)
+        payload["model"] = upstream_model
+        payload["stream"] = True
+
+        last_err = None
+        excluded: set[str] = set()
+        for attempt in range(MAX_RETRIES):
+            proxy = await self.pool.get_proxy(exclude=excluded)
+            started = False
+            try:
+                async for chunk in self._stream_request(proxy, payload):
+                    started = True
+                    yield chunk
+                await self.pool.report(proxy, OK)
+                return
+            except UpstreamError as e:
+                last_err = e
+                if started:
+                    # 已在出流中途失败：无法重试，标记状态后抛
+                    await self.pool.report(proxy, COOLDOWN)
+                    raise
+                if "429" not in str(e) and not str(e).startswith("upstream 5"):
+                    await self.pool.report(proxy, COOLDOWN)
+                    raise
+                await self.pool.report(proxy, COOLDOWN)
+                excluded.add(proxy)
+                continue
+            except httpx.HTTPError as e:
+                last_err = e
+                await self.pool.report(proxy, DEAD)
+                if started:
+                    raise
+                excluded.add(proxy)
+                continue
+        raise last_err or UpstreamError("no proxy retries left")
+
+    async def _stream_request(self, proxy: str, payload: dict):
+        """对单个代理发起流式 POST，产出上游原始字节块。"""
+        url = f"{self.settings.upstream_base}/chat/completions"
+        proxy_url = f"http://{proxy}"
+        timeout = httpx.Timeout(connect=15, read=300, write=30, pool=15)
+        async with httpx.AsyncClient(
+            timeout=timeout, proxy=proxy_url
+        ) as client, client.stream(
+            "POST", url, headers=zen_headers(), json=payload
+        ) as r:
+            if r.status_code >= 400:
+                body = await r.aread()
+                detail = body[:500].decode("utf-8", errors="replace")
+                raise UpstreamError(f"upstream {r.status_code}: {detail}")
+            async for chunk in r.aiter_bytes():
+                yield chunk
+
     async def _request(self, proxy: str, payload: dict) -> dict:
         url = f"{self.settings.upstream_base}/chat/completions"
         proxy_url = f"http://{proxy}"

@@ -67,6 +67,9 @@ class ProxyPool:
                 # 全部在途满或被排除：取最空闲的兜底（避免本次请求饿死）
                 candidates = [p for p in self._available if p not in exclude]
             if not candidates:
+                # exclude 排除了全部：池子太小，退回全部可用池挑最空闲
+                candidates = list(self._available)
+            if not candidates:
                 raise NoProxyAvailable("代理池无可用代理（全部被排除）")
             pick = min(candidates, key=lambda p: self._in_flight.get(p, 0))
             self._in_flight[pick] = self._in_flight.get(pick, 0) + 1
