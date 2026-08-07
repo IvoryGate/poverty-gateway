@@ -58,10 +58,10 @@ class UpstreamClient:
                 return await self._request(proxy, payload)
             except UpstreamError as e:
                 last_err = e
-                if "429" not in str(e):
-                    # 非限流错误（如 4xx 参数问题）重试无意义
+                if "429" not in str(e) and not str(e).startswith("upstream 5"):
+                    # 非限流且非上游 5xx（如 4xx 参数问题）重试无意义
                     raise
-                # 限流：记录被限流代理，换下一个
+                # 限流或上游 5xx：与当前代理 IP 相关，换代理重试
                 excluded.add(proxy)
                 continue
         raise last_err or UpstreamError("no proxy retries left")

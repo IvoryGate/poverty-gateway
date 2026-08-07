@@ -8,11 +8,11 @@
 
 from app.config import Settings
 
-# 对外伪名 → 内部真实模型名
+# 对外模型名 → 内部真实模型名（当前同名直出，后续可改为伪名）
 MODEL_MAP = {
-    "gpt-4o-mini": "deepseek-v4-flash-free",
-    "claude-haiku": "mimo-v2.5-free",
-    "gemini-flash": "ling-3.0-flash-free",
+    "deepseek-v4-flash-free": "deepseek-v4-flash-free",
+    "mimo-v2.5-free": "mimo-v2.5-free",
+    "longcat-2.0-free": "longcat-2.0-free",
 }
 
 # 对外暴露的模型列表（/v1/models 响应）
