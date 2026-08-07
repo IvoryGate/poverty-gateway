@@ -5,7 +5,7 @@
 **阶段 03 完成（API-Key 鉴权 + 每 key 限流）**
 > OpenAI 标准 `Authorization: Bearer <key>` 鉴权，/v1/models 与 /v1/chat/completions
 > 需 key，/health 放开（监控探活）。
-> 每 key 独立 rpm（固定窗口计数）：matrix:120 / dev:60 / ci:30，超限 429。
+> 每 key 独立 rpm（固定窗口计数）：matrix:30 / dev:15 / ci:10，超限 429。
 > key 存 /etc/poverty-gateway/keys.json（不进 git），systemd 环境变量注入。
 > 实测：无 key 401、错误 key 401、正确 key 200、rpm=1 测试 key 第2次起 429。
 > 33 测试通过 + ruff 全过。

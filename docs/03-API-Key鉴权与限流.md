@@ -41,7 +41,8 @@ key 文件放 `/etc/poverty-gateway/keys.json`（root:matrix 640 权限，不进
 
 ### 4. 部署配置
 
-- 生成 3 个 key（matrix: rpm120 / dev: rpm60 / ci: rpm30）
+- 生成 3 个 key（matrix: rpm30 / dev: rpm15 / ci: rpm10）——免费资源受限流，初始 120/60/30
+  偏高，调低一个量级避免打爆上游免费额度（实测 zen 429 频发）
 - systemd 加 `Environment=API_KEYS_FILE=/etc/poverty-gateway/keys.json`
 
 ## 技术决策及理由
