@@ -204,7 +204,41 @@ class ProxyPool:
                 break
 
     async def _fetch_candidates(self, quality: str) -> list[str]:
-        """从 proxy-pool /get 批量取候选 IP。返回 ["ip:port", ...] 或 []。"""
+        """取候选 IP：优先从 proxy-pool 的 Redis 读全量（db0 use_proxy）。
+
+        绕开 proxy-pool 按 stable 加权的取号逻辑——stable 是它对探活目标的
+        评分，与"zen 是否限流该 IP"无关。直接读全量 IP，用我们自己的 zen
+        探测筛出当前真正可用的。Redis 不可用时回退到 proxy-pool /get。
+        """
+        ips = await asyncio.to_thread(self._read_all_from_redis)
+        if not ips:
+            ips = await self._fetch_from_api(quality)
+        return ips
+
+    def _read_all_from_redis(self) -> list[str]:
+        """从 proxy-pool Redis（db0 use_proxy）读全量 IP。
+
+        用 urllib 解析 db 号替换为 0（proxy-pool 数据在 db0），避免字符串
+        replace 误伤 host 里的数字。
+        """
+        try:
+            from urllib.parse import urlparse, urlunparse
+
+            import redis as redis_py
+            parsed = urlparse(self.settings.redis_url)
+            # 强制 db=0（proxy-pool 数据所在库）
+            clean = urlunparse(parsed._replace(path="/0"))
+            r = redis_py.Redis.from_url(
+                clean, decode_responses=True, socket_connect_timeout=3,
+                socket_timeout=3,
+            )
+            keys = r.hkeys("use_proxy") or []
+            return [str(k) for k in keys if k]
+        except (redis_py.RedisError, ImportError, ValueError):
+            return []
+
+    async def _fetch_from_api(self, quality: str) -> list[str]:
+        """回退：proxy-pool /get 批量取候选。"""
         url = f"{self.settings.proxy_pool_url}/get"
         params = {
             "need": "global",

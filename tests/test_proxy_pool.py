@@ -205,6 +205,25 @@ async def test_report_dead_removes():
 
 
 @pytest.mark.asyncio
+async def test_fetch_candidates_redis_full():
+    """取候选优先读 proxy-pool Redis 全量（不依赖 https 标记）。"""
+    pool = make_pool({"stable3": ["1.1.1.1:80"], "stable2": [], "stable1": []})
+    # mock Redis 读返回全量
+    pool._read_all_from_redis = lambda: ["1.1.1.1:80", "2.2.2.2:80", "3.3.3.3:80"]  # type: ignore[method-assign]
+    ips = await pool._fetch_candidates("stable3")
+    assert len(ips) == 3
+
+
+@pytest.mark.asyncio
+async def test_fetch_candidates_fallback_api():
+    """Redis 读不到时回退 proxy-pool /get。"""
+    pool = make_pool({"stable3": ["1.1.1.1:80"], "stable2": [], "stable1": []})
+    pool._read_all_from_redis = list  # type: ignore[method-assign]
+    ips = await pool._fetch_candidates("stable3")
+    assert "1.1.1.1:80" in ips
+
+
+@pytest.mark.asyncio
 async def test_cooldown_uses_retry_after():
     """429 带上游 retry-after 时，冷却时长用上游解封时间。"""
     pool = make_pool(
