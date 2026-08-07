@@ -1,13 +1,21 @@
-"""proxy_pool 模块测试：档位降级、连通性筛选、缓存逻辑。
+"""proxy_pool 模块测试：档位降级、chat探测筛选、状态机（冷却/in-flight/补池）。
 
 用 httpx.MockTransport 模拟 proxy-pool /get 和上游探活，不依赖真实服务。
 """
+
+import time
 
 import httpx
 import pytest
 
 from app.config import Settings
-from app.core.proxy_pool import NoProxyAvailable, ProxyPool
+from app.core.proxy_pool import (
+    COOLDOWN,
+    DEAD,
+    OK,
+    NoProxyAvailable,
+    ProxyPool,
+)
 
 
 def make_settings(**kw):
@@ -16,32 +24,33 @@ def make_settings(**kw):
         "upstream_base": "https://upstream.test/zen/v1",
         "quality_chain": "stable3,stable2,stable1",
         "batch_size": 5,
-        "probe_concurrency": 5,
+        "probe_concurrency": 2,
         "probe_timeout": 5,
-        "pool_ttl": 60,
+        "probe_model": "deepseek-v4-flash-free",
+        "pool_low_water": 4,
+        "pool_target": 8,
+        "max_in_flight": 3,
     }
     base.update(kw)
     return Settings(**base)
 
 
-def make_pool(quality_to_proxies, **settings_kw):
-    """构造 ProxyPool：proxy-pool 按 quality 返回 IP，探活全部放行。"""
+def make_pool(quality_to_proxies, probe_results="ok", **settings_kw):
+    """构造 ProxyPool：proxy-pool 按 quality 返回 IP，探活按预设结果判定。"""
 
     def pool_handler(request: httpx.Request) -> httpx.Response:
         q = request.url.params.get("quality")
         proxies = quality_to_proxies.get(q, [])
         return httpx.Response(200, json={"code": 200, "data": proxies})
 
+    async def probe_fn(proxy: str) -> str:
+        return probe_results
+
     transport = httpx.MockTransport(pool_handler)
     client = httpx.AsyncClient(transport=transport)
     settings = make_settings(**settings_kw)
-    pool = ProxyPool(settings, client=client, probe_fn=_probe_pass)
+    pool = ProxyPool(settings, client=client, probe_fn=probe_fn)
     return pool
-
-
-async def _probe_pass(proxy: str) -> bool:
-    """测试用探活：任何 IP 都认为可用（不发起真实网络请求）。"""
-    return True
 
 
 @pytest.mark.asyncio
@@ -87,30 +96,54 @@ async def test_no_proxy_raises():
 
 
 @pytest.mark.asyncio
-async def test_cache_hits_within_ttl():
-    """TTL 内第二次取不重新请求 proxy-pool（只统计 /get 调用）。"""
+async def test_cooldown_proxy_not_selected():
+    """探测返回 COOLDOWN 的代理不进入可用池。"""
+    pool = make_pool(
+        {"stable3": ["1.1.1.1:80"], "stable2": [], "stable1": []},
+        probe_results=COOLDOWN,
+    )
+    with pytest.raises(NoProxyAvailable):
+        await pool.get_proxy()
+
+
+@pytest.mark.asyncio
+async def test_dead_proxy_not_selected():
+    """探测返回 DEAD 的代理不进入可用池。"""
+    pool = make_pool(
+        {"stable3": ["1.1.1.1:80"], "stable2": [], "stable1": []},
+        probe_results=DEAD,
+    )
+    with pytest.raises(NoProxyAvailable):
+        await pool.get_proxy()
+
+
+@pytest.mark.asyncio
+async def test_refill_stops_at_target():
+    """可用代理达到 pool_target 后，不再重复向 proxy-pool 取号。"""
     get_calls = {"n": 0}
 
     def handler(request: httpx.Request) -> httpx.Response:
         if str(request.url).startswith("http://pool.test/get"):
             get_calls["n"] += 1
-        return httpx.Response(200, json={"code": 200, "data": ["1.1.1.1:80"]})
+        proxies = [f"1.1.1.{i}:80" for i in range(1, 6)]
+        return httpx.Response(200, json={"code": 200, "data": proxies})
+
+    async def probe_fn(proxy: str) -> str:
+        return OK
 
     transport = httpx.MockTransport(handler)
     client = httpx.AsyncClient(transport=transport)
-    pool = ProxyPool(make_settings(), client=client, probe_fn=_probe_pass)
-    pool._http = client
+    pool = ProxyPool(make_settings(pool_target=5), client=client, probe_fn=probe_fn)
 
     await pool.get_proxy()
     await pool.get_proxy()
-    # 首次取触发一次刷新，第二次命中缓存不再请求 proxy-pool
+    # 目标 5 个：首次补齐后第二次命中池子，不再取号
     assert get_calls["n"] == 1
 
 
 @pytest.mark.asyncio
-async def test_cache_expires():
-    """TTL 过期后重新请求 proxy-pool。"""
-    settings = make_settings(pool_ttl=0)
+async def test_refill_when_low_water():
+    """可用池低于 low_water 时补池。"""
     get_calls = {"n": 0}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -118,11 +151,71 @@ async def test_cache_expires():
             get_calls["n"] += 1
         return httpx.Response(200, json={"code": 200, "data": ["1.1.1.1:80"]})
 
+    async def probe_fn(proxy: str) -> str:
+        return OK
+
     transport = httpx.MockTransport(handler)
     client = httpx.AsyncClient(transport=transport)
-    pool = ProxyPool(settings, client=client, probe_fn=_probe_pass)
-    pool._http = client
+    # 池目标 2、低水位 2：每次取都会低于水位，应多次补池（链上只有 stable3）
+    pool = ProxyPool(
+        make_settings(pool_target=2, pool_low_water=2, quality_chain="stable3"),
+        client=client, probe_fn=probe_fn,
+    )
 
     await pool.get_proxy()
     await pool.get_proxy()
     assert get_calls["n"] == 2
+
+
+@pytest.mark.asyncio
+async def test_in_flight_counts_and_release():
+    """取号后 in-flight 计数，release 后归还。"""
+    pool = make_pool(
+        {"stable3": ["1.1.1.1:80"], "stable2": [], "stable1": []},
+    )
+    proxy = await pool.get_proxy()
+    assert pool._in_flight[proxy] == 1
+    pool.release(proxy)
+    assert proxy not in pool._in_flight
+
+
+@pytest.mark.asyncio
+async def test_report_ok_resets_cooldown():
+    """冷却中的代理收到真实成功回写后回到可用池。"""
+    pool = make_pool(
+        {"stable3": ["1.1.1.1:80"], "stable2": [], "stable1": []},
+    )
+    proxy = await pool.get_proxy()
+    await pool.report(proxy, COOLDOWN)
+    assert proxy in pool._cooldown
+    assert proxy not in pool._available
+    await pool.report(proxy, OK)
+    assert proxy in pool._available
+
+
+@pytest.mark.asyncio
+async def test_report_dead_removes():
+    """真实请求连接失败：从可用池剔除。"""
+    pool = make_pool(
+        {"stable3": ["1.1.1.1:80"], "stable2": [], "stable1": []},
+    )
+    proxy = await pool.get_proxy()
+    await pool.report(proxy, DEAD)
+    assert proxy not in pool._available
+    assert proxy not in pool._cooldown
+
+
+@pytest.mark.asyncio
+async def test_cooldown_expiry_back_to_pool():
+    """冷却到期后代理自动回到可用池。"""
+    pool = make_pool(
+        {"stable3": ["1.1.1.1:80"], "stable2": [], "stable1": []},
+    )
+    proxy = await pool.get_proxy()
+    await pool.report(proxy, COOLDOWN)
+    assert proxy not in pool._available
+    # 手动把冷却时间改到过去，模拟到期
+    pool._cooldown[proxy]["until"] = time.time() - 1
+    got = await pool.get_proxy()
+    assert got == proxy
+    assert proxy in pool._available

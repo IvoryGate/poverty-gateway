@@ -3,31 +3,20 @@
 只经代理转发（proxy_pool.get_proxy()），绝不直连。
 """
 
-import uuid
-
 import httpx
 
 from app.config import Settings
+from app.core.headers import zen_headers
 from app.core.model_map import ModelMapper
-from app.core.proxy_pool import NoProxyAvailable, ProxyPool
+from app.core.proxy_pool import (
+    COOLDOWN,
+    DEAD,
+    OK,
+    NoProxyAvailable,
+    ProxyPool,
+)
 
-
-def _zen_headers() -> dict[str, str]:
-    """构造上游要求的请求头。
-
-    说明：上游按请求头做 IP 级限流识别；session/request id 每次唯一，
-    避免被当作重复请求。这些头为公共端点约定（无认证、无 key）。
-    """
-    return {
-        "Authorization": "Bearer public",
-        "Content-Type": "application/json",
-        "User-Agent": "opencode/1.15.0",
-        "x-api-key": "public",
-        "x-opencode-client": "cli",
-        "x-opencode-project": "global",
-        "x-opencode-request": f"msg_{uuid.uuid4().hex[:20]}",
-        "x-opencode-session": f"ses_{uuid.uuid4().hex[:20]}",
-    }
+MAX_RETRIES = 5
 
 
 class UpstreamClient:
@@ -41,10 +30,13 @@ class UpstreamClient:
     async def chat(self, public_model: str, payload: dict):
         """转发一次 chat completion（非流式）。
 
-        public_model: 对外伪名。
+        public_model: 对外模型名。
         payload: 客户端传来的完整 body（model 会被替换为真实名）。
 
-        限流/失败时自动换代理重试（免费代理常被限流，需轮换）。
+        失败时换代理重试，并把结果回写代理池（隐式探测）：
+        - 429/上游5xx：与当前代理 IP 相关 → 换代理重试，标记冷却
+        - 连接失败     → 剔除该代理，换一个重试
+        - 其他 4xx     → 参数问题，重试无意义，直接抛
         """
         upstream_model = self.models.to_upstream(public_model)
         payload = dict(payload)
@@ -52,16 +44,25 @@ class UpstreamClient:
 
         last_err = None
         excluded: set[str] = set()
-        for _ in range(3):
+        for attempt in range(MAX_RETRIES):
+            proxy = await self.pool.get_proxy(exclude=excluded)
             try:
-                proxy = await self.pool.get_proxy(exclude=excluded)
-                return await self._request(proxy, payload)
+                result = await self._request(proxy, payload)
+                await self.pool.report(proxy, OK)
+                return result
             except UpstreamError as e:
                 last_err = e
                 if "429" not in str(e) and not str(e).startswith("upstream 5"):
                     # 非限流且非上游 5xx（如 4xx 参数问题）重试无意义
+                    await self.pool.report(proxy, COOLDOWN)
                     raise
-                # 限流或上游 5xx：与当前代理 IP 相关，换代理重试
+                await self.pool.report(proxy, COOLDOWN)
+                excluded.add(proxy)
+                continue
+            except httpx.HTTPError as e:
+                # 连接/传输层失败：该代理不可用，剔除后换一个
+                last_err = e
+                await self.pool.report(proxy, DEAD)
                 excluded.add(proxy)
                 continue
         raise last_err or UpstreamError("no proxy retries left")
@@ -73,7 +74,7 @@ class UpstreamClient:
             timeout=120, proxy=proxy_url
         ) as client:
             r = await client.post(
-                url, headers=_zen_headers(), json=payload
+                url, headers=zen_headers(), json=payload
             )
         if r.status_code >= 400:
             detail = r.text[:500]
@@ -84,9 +85,12 @@ class UpstreamClient:
         """网关自身健康状态：代理池有无可用 + 上游探活（走代理）。"""
         try:
             proxy = await self.pool.get_proxy()
-            upstream_ok = await self._probe_upstream(proxy)
         except NoProxyAvailable:
             return {"status": "degraded", "pool": "empty"}
+        try:
+            upstream_ok = await self._probe_upstream(proxy)
+        finally:
+            self.pool.release(proxy)
         return {
             "status": "ok" if upstream_ok else "degraded",
             "pool": "ok",
