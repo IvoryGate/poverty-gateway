@@ -1,4 +1,4 @@
-"""OpenAI 兼容路由：/v1/models、/v1/chat/completions、/health、/v1/stats。
+"""OpenAI 兼容路由：/v1/models、/v1/chat/completions、/health、/v1/stats、/panel。
 
 设计原则：**宽松透传**——请求体以原始 dict 接收，只校验 model/messages 必需，
 其余字段（tools、tool_choice、reasoning_effort、stream_options、stop、n 等）
@@ -7,10 +7,11 @@
 """
 
 import json
+import os
 import time
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 
 from app.core.auth import AuthError, AuthManager, RateLimitExceeded
 from app.core.proxy_pool import NoProxyAvailable
@@ -250,3 +251,19 @@ async def stats(request: Request, _key: str = Depends(_require_key)):
 async def health(request: Request):
     client: UpstreamClient = request.app.state.upstream
     return await client.health()
+
+
+@router.get("/panel", response_class=HTMLResponse)
+async def panel():
+    """监控面板页面（自包含 HTML，前端用 API key 鉴权拉取数据）。"""
+    import asyncio
+    path = os.path.join(os.path.dirname(__file__), "panel.html")
+
+    def _read():
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+
+    try:
+        return HTMLResponse(await asyncio.to_thread(_read))
+    except OSError:
+        raise HTTPException(status_code=500, detail="panel not found")
