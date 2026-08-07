@@ -253,9 +253,20 @@ async def health(request: Request):
     return await client.health()
 
 
+@router.get("/", response_class=HTMLResponse)
+async def root_panel():
+    """根路径：监控面板页面。"""
+    return await _panel_html()
+
+
 @router.get("/panel", response_class=HTMLResponse)
 async def panel():
-    """监控面板页面（自包含 HTML，前端用 API key 鉴权拉取数据）。"""
+    """监控面板页面（/panel 别名）。"""
+    return await _panel_html()
+
+
+async def _panel_html():
+    """读取并返回面板 HTML。"""
     import asyncio
     path = os.path.join(os.path.dirname(__file__), "panel.html")
 
