@@ -32,6 +32,14 @@ _K_INFLIGHT = "inflight:"   # in-flight 计数
 _K_COOLDOWN = "cooldown:"   # 冷却区（值 = "strike:quality"，带 TTL）
 
 
+def _as_int(raw) -> int:
+    """store.get 返回字符串，安全转 int。"""
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return 0
+
+
 class NoProxyAvailable(Exception):
     """候选档位链全空，无可用代理。"""
 
@@ -76,7 +84,7 @@ class ProxyPool:
             candidates = [
                 p for p in self._available
                 if p not in exclude
-                and self._store.get(_K_INFLIGHT + p) < self.settings.max_in_flight
+                and _as_int(self._store.get(_K_INFLIGHT + p)) < self.settings.max_in_flight
                 and not self._store.exists(_K_COOLDOWN + p)
             ]
             if not candidates:
@@ -91,7 +99,7 @@ class ProxyPool:
             if not candidates:
                 self._metrics["no_proxy_errors"] += 1
                 raise NoProxyAvailable("代理池无可用代理（全部被排除）")
-            pick = min(candidates, key=lambda p: self._store.get(_K_INFLIGHT + p))
+            pick = min(candidates, key=lambda p: _as_int(self._store.get(_K_INFLIGHT + p)))
             self._store.incr(_K_INFLIGHT + pick)
             return pick
 
@@ -117,7 +125,7 @@ class ProxyPool:
 
     def metrics(self) -> dict:
         """代理池水位与健康指标（快照）。"""
-        in_flight = sum(self._store.get(_K_INFLIGHT + p) for p in self._available)
+        in_flight = sum(_as_int(self._store.get(_K_INFLIGHT + p)) for p in self._available)
         cooldown_n = len(self._store.keys(_K_COOLDOWN + "*"))
         return {
             "available": len(self._available),

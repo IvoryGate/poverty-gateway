@@ -70,13 +70,16 @@ class RedisStore:
         self._memory[key] = max(self._memory.get(key, 0) - 1, 0)
         return self._memory[key]
 
-    def get(self, key: str) -> int:
+    def get(self, key: str) -> str | None:
+        """读取原始值（字符串或 None）。需要数值时调用方自行转换。"""
         if self._client is not None:
             try:
-                return int(self._client.get(key) or 0)
+                return self._client.get(key)
             except redis.RedisError:
                 self._client = None
-        return self._memory.get(key, 0)
+        if key in self._memory:
+            return str(self._memory[key])
+        return None
 
     def setex(self, key: str, ttl: int, value: str = "1"):
         """带 TTL 写入（冷却区用）。"""
@@ -88,6 +91,19 @@ class RedisStore:
                 self._client = None
         self._memory[key] = 1
         self._mem_ts[key] = time.time() + ttl
+
+    def setex_once(self, key: str, ttl: int, value: str = "1") -> bool:
+        """SET NX + TTL：仅当 key 不存在时写入，返回是否成功（抢锁用）。"""
+        if self._client is not None:
+            try:
+                return bool(self._client.set(key, value, ex=ttl, nx=True))
+            except redis.RedisError:
+                self._client = None
+        if key in self._memory and time.time() <= self._mem_ts.get(key, 0):
+            return False
+        self._memory[key] = 1
+        self._mem_ts[key] = time.time() + ttl
+        return True
 
     def exists(self, key: str) -> bool:
         if self._client is not None:

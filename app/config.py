@@ -91,6 +91,18 @@ class Settings:
         self.cb_failure_threshold = self._get_int("CB_FAILURE_THRESHOLD", 10)
         self.cb_open_seconds = self._get_int("CB_OPEN_SECONDS", 15)  # 熔断时长
 
+        # 模型源同步：自动发现/摘除 free 模型
+        self.model_sync_interval = self._get_int("MODEL_SYNC_INTERVAL", 600)  # 秒
+
+        # 禁用模型名单（逗号分隔），自动同步时排除
+        deny = self._get("MODEL_DENYLIST", "")
+        if isinstance(deny, (list, tuple)):
+            self.model_denylist = [str(d) for d in deny]
+        elif deny:
+            self.model_denylist = [d.strip() for d in deny.split(",") if d.strip()]
+        else:
+            self.model_denylist = []
+
         # 对外服务端口
         self.port = self._get_int("PORT", 8000)
 

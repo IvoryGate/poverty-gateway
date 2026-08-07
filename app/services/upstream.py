@@ -28,10 +28,11 @@ _CB_OPEN = "cb:open"     # 熔断开关
 class UpstreamClient:
     """转发器：把 /v1/chat/completions 请求经代理发到上游。"""
 
-    def __init__(self, settings: Settings = None, store: RedisStore = None):
+    def __init__(self, settings: Settings = None, store: RedisStore = None,
+                 pool=None, models=None):
         self.settings = settings or Settings()
-        self.pool = ProxyPool(settings)
-        self.models = ModelMapper(settings)
+        self.pool = pool or ProxyPool(settings)
+        self.models = models or ModelMapper(settings)
         self._store = store or RedisStore(settings)
 
     def _circuit_open(self) -> bool:

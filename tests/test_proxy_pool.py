@@ -3,8 +3,6 @@
 用 httpx.MockTransport 模拟 proxy-pool /get 和上游探活，不依赖真实服务。
 """
 
-import time
-
 import httpx
 import pytest
 
@@ -174,9 +172,9 @@ async def test_in_flight_counts_and_release():
         {"stable3": ["1.1.1.1:80"], "stable2": [], "stable1": []},
     )
     proxy = await pool.get_proxy()
-    assert pool._in_flight[proxy] == 1
+    assert int(pool._store.get("inflight:" + proxy) or 0) == 1
     pool.release(proxy)
-    assert proxy not in pool._in_flight
+    assert int(pool._store.get("inflight:" + proxy) or 0) == 0
 
 
 @pytest.mark.asyncio
@@ -187,10 +185,11 @@ async def test_report_ok_resets_cooldown():
     )
     proxy = await pool.get_proxy()
     await pool.report(proxy, COOLDOWN)
-    assert proxy in pool._cooldown
+    assert pool._store.exists("cooldown:" + proxy)
     assert proxy not in pool._available
     await pool.report(proxy, OK)
     assert proxy in pool._available
+    assert not pool._store.exists("cooldown:" + proxy)
 
 
 @pytest.mark.asyncio
@@ -202,20 +201,22 @@ async def test_report_dead_removes():
     proxy = await pool.get_proxy()
     await pool.report(proxy, DEAD)
     assert proxy not in pool._available
-    assert proxy not in pool._cooldown
+    assert not pool._store.exists("cooldown:" + proxy)
 
 
 @pytest.mark.asyncio
-async def test_cooldown_expiry_back_to_pool():
-    """冷却到期后代理自动回到可用池。"""
+async def test_cooldown_expiry_allows_reuse():
+    """冷却 TTL 到期后该代理不再被屏蔽（可经补池重新纳入）。"""
     pool = make_pool(
         {"stable3": ["1.1.1.1:80"], "stable2": [], "stable1": []},
     )
     proxy = await pool.get_proxy()
     await pool.report(proxy, COOLDOWN)
+    assert pool._store.exists("cooldown:" + proxy)
     assert proxy not in pool._available
-    # 手动把冷却时间改到过去，模拟到期
-    pool._cooldown[proxy]["until"] = time.time() - 1
+    # 手动删除冷却键，模拟 TTL 到期
+    pool._store.delete("cooldown:" + proxy)
+    # 低水位触发补池：探测通过后该代理重新入池
     got = await pool.get_proxy()
     assert got == proxy
     assert proxy in pool._available

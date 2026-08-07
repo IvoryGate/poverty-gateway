@@ -13,7 +13,6 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from app.core.auth import AuthError, AuthManager, RateLimitExceeded
-from app.core.model_map import ModelMapper
 from app.core.proxy_pool import NoProxyAvailable
 from app.core.usage import UsageTracker
 from app.services.upstream import UpstreamClient, UpstreamError
@@ -36,8 +35,8 @@ def _require_key(request: Request) -> str:
 
 @router.get("/v1/models")
 async def list_models(request: Request, _key: str = Depends(_require_key)):
-    mapper = ModelMapper(request.app.state.settings)
-    return {"object": "list", "data": mapper.list_public()}
+    client: UpstreamClient = request.app.state.upstream
+    return {"object": "list", "data": client.models.list_public()}
 
 
 @router.post("/v1/chat/completions")
