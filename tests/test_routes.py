@@ -202,6 +202,31 @@ async def test_rate_limit_429():
 
 
 @pytest.mark.asyncio
+async def test_no_version_endpoint_alias():
+    """不带 /v1 前缀的 /chat/completions 与 /models 也可用（兼容各种 baseURL）。"""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={
+            "id": "x", "object": "chat.completion", "created": 0,
+            "model": "deepseek-v4-flash-free",
+            "choices": [{"index": 0, "finish_reason": "stop",
+                         "message": {"role": "assistant", "content": "ok"}}],
+        })
+
+    app = make_app(handler)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        r1 = await ac.post(
+            "/chat/completions",
+            headers={"Authorization": "Bearer sk-alice"},
+            json={"model": "deepseek-v4-flash-free",
+                  "messages": [{"role": "user", "content": "hi"}]})
+        r2 = await ac.get("/models",
+                          headers={"Authorization": "Bearer sk-alice"})
+    assert r1.status_code == 200
+    assert r2.status_code == 200
+
+
+@pytest.mark.asyncio
 async def test_stats_tracks_usage():
     """请求后 /v1/stats 记录每 key 请求数与 token。"""
     def handler(request: httpx.Request) -> httpx.Response:

@@ -39,8 +39,25 @@ async def list_models(request: Request, _key: str = Depends(_require_key)):
     return {"object": "list", "data": client.models.list_public()}
 
 
+@router.get("/models")
+async def list_models_no_version(request: Request, _key: str = Depends(_require_key)):
+    """兼容 baseURL 不带 /v1 的客户端。"""
+    client: UpstreamClient = request.app.state.upstream
+    return {"object": "list", "data": client.models.list_public()}
+
+
 @router.post("/v1/chat/completions")
 async def chat_completions(request: Request, _key: str = Depends(_require_key)):
+    return await _chat_completions(request, _key)
+
+
+@router.post("/chat/completions")
+async def chat_completions_no_version(request: Request, _key: str = Depends(_require_key)):
+    """兼容 baseURL 不带 /v1 的客户端（@ai-sdk/openai-compatible 等）。"""
+    return await _chat_completions(request, _key)
+
+
+async def _chat_completions(request: Request, key: str):
     client: UpstreamClient = request.app.state.upstream
     usage: UsageTracker = request.app.state.usage
     try:
@@ -57,7 +74,7 @@ async def chat_completions(request: Request, _key: str = Depends(_require_key)):
         raise HTTPException(status_code=400, detail="field 'messages' is required")
 
     if payload.get("stream"):
-        return await _stream_completions(client, model, payload, _key, usage)
+        return await _stream_completions(client, model, payload, key, usage)
 
     t0 = time.time()
     try:
@@ -70,7 +87,7 @@ async def chat_completions(request: Request, _key: str = Depends(_require_key)):
         raise HTTPException(status_code=502, detail=str(e))
     finally:
         pass
-    usage.record(_key, success=True, latency_ms=(time.time() - t0) * 1000,
+    usage.record(key, success=True, latency_ms=(time.time() - t0) * 1000,
                  tokens_in=_usage_num(result, "prompt_tokens"),
                  tokens_out=_usage_num(result, "completion_tokens"))
     return result
