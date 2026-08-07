@@ -1,4 +1,4 @@
-"""OpenAI 兼容路由：/v1/models、/v1/chat/completions、/health。
+"""OpenAI 兼容路由：/v1/models、/v1/chat/completions、/health、/v1/stats。
 
 设计原则：**宽松透传**——请求体以原始 dict 接收，只校验 model/messages 必需，
 其余字段（tools、tool_choice、reasoning_effort、stream_options、stop、n 等）
@@ -7,6 +7,7 @@
 """
 
 import json
+import time
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -14,6 +15,7 @@ from fastapi.responses import StreamingResponse
 from app.core.auth import AuthError, AuthManager, RateLimitExceeded
 from app.core.model_map import ModelMapper
 from app.core.proxy_pool import NoProxyAvailable
+from app.core.usage import UsageTracker
 from app.services.upstream import UpstreamClient, UpstreamError
 
 router = APIRouter()
@@ -41,6 +43,7 @@ async def list_models(request: Request, _key: str = Depends(_require_key)):
 @router.post("/v1/chat/completions")
 async def chat_completions(request: Request, _key: str = Depends(_require_key)):
     client: UpstreamClient = request.app.state.upstream
+    usage: UsageTracker = request.app.state.usage
     try:
         payload = await request.json()
     except (json.JSONDecodeError, ValueError, UnicodeDecodeError):
@@ -55,8 +58,9 @@ async def chat_completions(request: Request, _key: str = Depends(_require_key)):
         raise HTTPException(status_code=400, detail="field 'messages' is required")
 
     if payload.get("stream"):
-        return await _stream_completions(client, model, payload)
+        return await _stream_completions(client, model, payload, _key, usage)
 
+    t0 = time.time()
     try:
         result = await client.chat(model, payload)
     except KeyError as e:
@@ -65,22 +69,36 @@ async def chat_completions(request: Request, _key: str = Depends(_require_key)):
         raise HTTPException(status_code=503, detail=str(e))
     except UpstreamError as e:
         raise HTTPException(status_code=502, detail=str(e))
+    finally:
+        pass
+    usage.record(_key, success=True, latency_ms=(time.time() - t0) * 1000,
+                 tokens_in=_usage_num(result, "prompt_tokens"),
+                 tokens_out=_usage_num(result, "completion_tokens"))
     return result
 
 
-async def _stream_completions(client: UpstreamClient, model: str, payload: dict):
+async def _stream_completions(client: UpstreamClient, model: str, payload: dict,
+                              key: str, usage: UsageTracker):
     """SSE 流式透传：把上游字节块边读边发给客户端。"""
 
     async def gen():
+        t0 = time.time()
+        ok = False
+        ti = to = 0
         try:
             async for chunk in client.chat_stream(model, payload):
+                ok = True
                 yield chunk
+                ti, to = _scan_stream_usage(chunk, ti, to)
         except KeyError as e:
             yield _sse_error(f"Unknown model: {e}")
         except NoProxyAvailable as e:
             yield _sse_error(str(e))
         except UpstreamError as e:
             yield _sse_error(str(e))
+        finally:
+            usage.record(key, success=ok, latency_ms=(time.time() - t0) * 1000,
+                         tokens_in=ti, tokens_out=to)
 
     return StreamingResponse(
         gen(),
@@ -93,6 +111,44 @@ def _sse_error(message: str) -> bytes:
     """把错误编码为 SSE error 事件（兼容 OpenAI 客户端解析）。"""
     body = {"error": {"message": message, "type": "proxy_pool_error"}}
     return f"data: {json.dumps(body)}\n\n".encode()
+
+
+def _usage_num(result: dict, key: str) -> int:
+    """从非流式响应 usage 里取 token 数。"""
+    usage = result.get("usage") or {}
+    try:
+        return int(usage.get(key, 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _scan_stream_usage(chunk: bytes, ti: int, to: int) -> tuple[int, int]:
+    """扫描流式块里的 usage 字段（SSE 末尾 data: {usage}），返回累计 token。"""
+    text = chunk.decode("utf-8", errors="ignore")
+    for line in text.splitlines():
+        if line.startswith("data:"):
+            body = line[5:].strip()
+            if body and body != "[DONE]":
+                try:
+                    obj = json.loads(body)
+                    u = obj.get("usage")
+                    if isinstance(u, dict):
+                        p = u.get("prompt_tokens")
+                        c = u.get("completion_tokens")
+                        if isinstance(p, int):
+                            ti = p
+                        if isinstance(c, int):
+                            to = c
+                except json.JSONDecodeError:
+                    continue
+    return ti, to
+
+
+@router.get("/v1/stats")
+async def stats(request: Request, _key: str = Depends(_require_key)):
+    """用量统计（需有效 API key）。"""
+    usage: UsageTracker = request.app.state.usage
+    return usage.stats()
 
 
 @router.get("/health")

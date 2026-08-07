@@ -199,3 +199,34 @@ async def test_rate_limit_429():
             json={"model": "deepseek-v4-flash-free",
                   "messages": [{"role": "user", "content": "hi"}]})
     assert r.status_code == 429
+
+
+@pytest.mark.asyncio
+async def test_stats_tracks_usage():
+    """请求后 /v1/stats 记录每 key 请求数与 token。"""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={
+            "id": "x", "object": "chat.completion", "created": 0,
+            "model": "deepseek-v4-flash-free",
+            "choices": [{"index": 0, "finish_reason": "stop",
+                         "message": {"role": "assistant", "content": "ok"}}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5,
+                      "total_tokens": 15},
+        })
+
+    app = make_app(handler)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        await ac.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer sk-alice"},
+            json={"model": "deepseek-v4-flash-free",
+                  "messages": [{"role": "user", "content": "hi"}]})
+        r = await ac.get("/v1/stats",
+                         headers={"Authorization": "Bearer sk-alice"})
+    assert r.status_code == 200
+    data = r.json()
+    assert data["totals"]["requests"] == 1
+    assert data["totals"]["tokens_in"] == 10
+    assert data["totals"]["tokens_out"] == 5
+    assert data["per_key"]["sk-alice"]["requests"] == 1
