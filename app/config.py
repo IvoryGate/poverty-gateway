@@ -91,8 +91,8 @@ class Settings:
         self.cb_failure_threshold = self._get_int("CB_FAILURE_THRESHOLD", 10)
         self.cb_open_seconds = self._get_int("CB_OPEN_SECONDS", 15)  # 熔断时长
 
-        # 模型源同步：自动发现/摘除 free 模型
-        self.model_sync_interval = self._get_int("MODEL_SYNC_INTERVAL", 600)  # 秒
+        # 模型源同步：自动发现/摘除 free 模型（一天一次足够，上游不会频繁调整）
+        self.model_sync_interval = self._get_int("MODEL_SYNC_INTERVAL", 86400)  # 秒
 
         # 禁用模型名单（逗号分隔），自动同步时排除
         deny = self._get("MODEL_DENYLIST", "")
