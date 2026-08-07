@@ -65,6 +65,8 @@ class ProxyPool:
             "dead_reports": 0,       # 真实请求连接失败回写次数
             "no_proxy_errors": 0,    # 取号失败次数
         }
+        # 探测出的 retry-after（proxy -> 秒），供 _mark_cooldown 精确冷却
+        self._probe_retry: dict[str, int] = {}
 
     # ---------- 对外接口 ----------
 
@@ -234,7 +236,10 @@ class ProxyPool:
                 if status == OK:
                     return proxy
                 if status == COOLDOWN:
-                    self._mark_cooldown(proxy, quality)
+                    # 探测 429：用上游 retry-after（若有）精确冷却，避免反复探测
+                    self._mark_cooldown(
+                        proxy, quality,
+                        cooldown_seconds=self._probe_retry.get(proxy, 0))
                 return None
 
         results = await asyncio.gather(*(one(p) for p in proxies))
@@ -244,7 +249,8 @@ class ProxyPool:
         """单个 IP 的最小 chat 探测：能出对话才算可用。
 
         探测请求用最小 token 的 chat（max_tokens=1），只求拿到 200。
-        429 → 限流（COOLDOWN）；连不上/其他 → DEAD。
+        429 → 限流（COOLDOWN），并把 retry-after 记录到 _probe_retry；
+        连不上/其他 → DEAD。
         注：httpx 0.28 代理参数在 client 构造时传，每 IP 独立 client。
         """
         url = f"{self.settings.upstream_base}/chat/completions"
@@ -264,5 +270,10 @@ class ProxyPool:
         if r.status_code == 200:
             return OK
         if r.status_code == 429:
+            try:
+                self._probe_retry[proxy] = max(int(
+                    r.headers.get("retry-after", "0") or 0), 0)
+            except (TypeError, ValueError):
+                self._probe_retry[proxy] = 0
             return COOLDOWN
         return DEAD

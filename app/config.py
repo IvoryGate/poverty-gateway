@@ -46,11 +46,11 @@ class Settings:
         chain = self._get("QUALITY_CHAIN", "stable3,stable2,stable1")
         self.quality_chain = [q.strip() for q in chain.split(",")]
 
-        # 单次从 proxy-pool 批量取的候选数（连通性筛选后取其一）
-        self.batch_size = self._get_int("BATCH_SIZE", 8)
+        # 单次从 proxy-pool 批量取的候选数（proxy-pool 实测最多稳定给 ~14 个）
+        self.batch_size = self._get_int("BATCH_SIZE", 14)
 
-        # 对候选 IP 做 zen 连通性筛选的并发数（探测严格限制，最多 2）
-        self.probe_concurrency = self._get_int("PROBE_CONCURRENCY", 2)
+        # 对候选 IP 做 zen 连通性筛选的并发数（探测克制，防自我限流）
+        self.probe_concurrency = self._get_int("PROBE_CONCURRENCY", 3)
 
         # 连通性筛选单 IP 超时（秒）
         self.probe_timeout = self._get_float("PROBE_TIMEOUT", 15)
@@ -58,14 +58,14 @@ class Settings:
         # 探测/冷启动使用的最小 chat 模型（能出对话即视为可用）
         self.probe_model = self._get("PROBE_MODEL", "deepseek-v4-flash-free")
 
-        # 可用池低水位：低于此数触发补池
-        self.pool_low_water = self._get_int("POOL_LOW_WATER", 4)
+        # 可用池低水位：低于此数触发补池（应对 3-5 个 key 并发）
+        self.pool_low_water = self._get_int("POOL_LOW_WATER", 6)
 
-        # 可用池目标规模：补池到此数即停
-        self.pool_target = self._get_int("POOL_TARGET", 8)
+        # 可用池目标规模：补池到此数即停（与 batch_size 留余量）
+        self.pool_target = self._get_int("POOL_TARGET", 12)
 
         # 单个 IP 最大在途并发：超过则取号时跳过，避免同 IP 被打爆
-        self.max_in_flight = self._get_int("MAX_IN_FLIGHT", 3)
+        self.max_in_flight = self._get_int("MAX_IN_FLIGHT", 5)
 
         # API-Key 鉴权：是否启用（默认启用；测试可关）
         self.auth_enabled = self._get_bool("AUTH_ENABLED", True)
