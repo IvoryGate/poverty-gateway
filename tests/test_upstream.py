@@ -145,3 +145,24 @@ async def test_chat_stream_report_dead_on_conn_error():
         "deepseek-v4-flash-free", {"model": "x"})]
     assert calls["n"] == 2
     assert chunks == [b"data: [DONE]\n\n"]
+
+
+@pytest.mark.asyncio
+async def test_circuit_breaker_trips_on_many_failures():
+    """窗口内失败超阈值 → 熔断打开，后续请求快速失败。"""
+    client = make_client(lambda r: httpx.Response(200, content=b""),
+                         proxies=["1.1.1.1:80", "2.2.2.2:80"])
+    settings = make_settings(cb_failure_threshold=3, cb_window=30)
+    client.settings = settings
+    client._store = type(client._store)(settings)
+
+    # 3 次失败触发熔断（直接注入失败计数，模拟上游 429/5xx）
+    for _ in range(3):
+        client._register_failure()
+    assert client._circuit_open()
+
+    # 熔断打开：快速失败，不再尝试上游
+    with pytest.raises(UpstreamError):
+        async for _ in client.chat_stream(
+                "deepseek-v4-flash-free", {"model": "x"}):
+            pass

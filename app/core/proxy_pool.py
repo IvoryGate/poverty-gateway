@@ -4,6 +4,9 @@
 每个 IP 只有通过"最小 chat 探测"才算可用，并维护 in-flight 计数与
 冷却记忆，避免并发撞同一 IP、避免反复踩被限流的 IP。
 
+多 worker 一致性：in-flight 与冷却区落 RedisStore（Redis 或内存降级），
+`_available` 可用池为进程内（各 worker 独立补池，量小成本低）。
+
 关键约束（项目铁律）：
 - 完全禁用本地 IP 直连——只走 proxy-pool 提供的 IP。
 - 档位降级链：stable3 → stable2 → stable1，全无则停止（503）。
@@ -12,17 +15,21 @@
 """
 
 import asyncio
-import time
 
 import httpx
 
 from app.config import Settings
 from app.core.headers import zen_headers
+from app.core.redis_store import RedisStore
 
 # 探测/回写状态常量
 OK = "ok"                 # 真实请求成功，可用
 COOLDOWN = "cooldown"     # 限流，短期回避（指数退避）
 DEAD = "dead"             # 连接失败，剔除
+
+# Redis 键前缀
+_K_INFLIGHT = "inflight:"   # in-flight 计数
+_K_COOLDOWN = "cooldown:"   # 冷却区（值 = "strike:quality"，带 TTL）
 
 
 class NoProxyAvailable(Exception):
@@ -31,17 +38,16 @@ class NoProxyAvailable(Exception):
 
 class ProxyPool:
     def __init__(self, settings: Settings = None, client: httpx.AsyncClient = None,
-                 probe_fn=None):
+                 probe_fn=None, store: RedisStore = None):
         self.settings = settings or Settings()
         self._lock = asyncio.Lock()
         # 测试时可注入 MockTransport 的 client；probe_fn 可注入探活函数
         self._http = client or httpx.AsyncClient(timeout=10)
         self._probe_fn = probe_fn or self._probe
+        self._store = store or RedisStore(settings)
 
-        # 状态机
+        # 状态机（_available 进程内；in-flight/冷却走 store）
         self._available: dict[str, dict] = {}   # proxy -> {"quality": str}
-        self._in_flight: dict[str, int] = {}    # proxy -> 在途请求数
-        self._cooldown: dict[str, dict] = {}    # proxy -> {"until": ts, "strike": n}
         self._warm = False                      # 是否已做过首次补池
 
         # 观测指标
@@ -62,7 +68,6 @@ class ProxyPool:
         """
         exclude = exclude or set()
         async with self._lock:
-            self._sweep_cooldown()
             if not self._warm or self._low_water():
                 await self._refill()
             if not self._available:
@@ -70,42 +75,37 @@ class ProxyPool:
                 raise NoProxyAvailable("代理池无可用代理")
             candidates = [
                 p for p in self._available
-                if p not in exclude and self._in_flight.get(p, 0) < self.settings.max_in_flight
+                if p not in exclude
+                and self._store.get(_K_INFLIGHT + p) < self.settings.max_in_flight
+                and not self._store.exists(_K_COOLDOWN + p)
             ]
             if not candidates:
-                # 全部在途满或被排除：取最空闲的兜底（避免本次请求饿死）
-                candidates = [p for p in self._available if p not in exclude]
+                # 全部在途满/冷却/被排除：取最空闲且未冷却的兜底
+                candidates = [
+                    p for p in self._available
+                    if p not in exclude and not self._store.exists(_K_COOLDOWN + p)
+                ]
             if not candidates:
-                # exclude 排除了全部：池子太小，退回全部可用池挑最空闲
+                # 冷却区排除了全部：退回全部可用池挑最空闲（本次请求兜底）
                 candidates = list(self._available)
             if not candidates:
                 self._metrics["no_proxy_errors"] += 1
                 raise NoProxyAvailable("代理池无可用代理（全部被排除）")
-            pick = min(candidates, key=lambda p: self._in_flight.get(p, 0))
-            self._in_flight[pick] = self._in_flight.get(pick, 0) + 1
+            pick = min(candidates, key=lambda p: self._store.get(_K_INFLIGHT + p))
+            self._store.incr(_K_INFLIGHT + pick)
             return pick
 
     def release(self, proxy: str):
-        """请求结束（无论成败）归还 in-flight 计数。
-
-        同步方法：in_flight 是普通 dict，单线程事件循环下增减原子。
-        """
-        n = self._in_flight.get(proxy, 0) - 1
-        if n > 0:
-            self._in_flight[proxy] = n
-        else:
-            self._in_flight.pop(proxy, None)
+        """请求结束（无论成败）归还 in-flight 计数。"""
+        self._store.decr(_K_INFLIGHT + proxy)
 
     async def report(self, proxy: str, status: str):
         """真实请求结果回写池状态（隐式探测，不额外消耗上游）。"""
         async with self._lock:
-            self._in_flight.pop(proxy, None)
+            self._store.decr(_K_INFLIGHT + proxy)
             if status == OK:
-                info = self._cooldown.pop(proxy, None)
-                if info is not None:
-                    # 从冷却区恢复：保留原 quality，重新进入可用池
-                    self._available[proxy] = {"quality": info.get("quality", "")}
-                elif proxy not in self._available:
+                self._store.delete(_K_COOLDOWN + proxy)
+                if proxy not in self._available:
                     self._available[proxy] = {"quality": ""}
             elif status == COOLDOWN:
                 self._metrics["cooldown_reports"] += 1
@@ -113,14 +113,16 @@ class ProxyPool:
             elif status == DEAD:
                 self._metrics["dead_reports"] += 1
                 self._available.pop(proxy, None)
-                self._cooldown.pop(proxy, None)
+                self._store.delete(_K_COOLDOWN + proxy)
 
     def metrics(self) -> dict:
         """代理池水位与健康指标（快照）。"""
+        in_flight = sum(self._store.get(_K_INFLIGHT + p) for p in self._available)
+        cooldown_n = len(self._store.keys(_K_COOLDOWN + "*"))
         return {
             "available": len(self._available),
-            "in_flight": sum(self._in_flight.values()),
-            "cooldown": len(self._cooldown),
+            "in_flight": in_flight,
+            "cooldown": cooldown_n,
             "target": self.settings.pool_target,
             "low_water": self.settings.pool_low_water,
             "refill_count": self._metrics["refill_count"],
@@ -135,26 +137,23 @@ class ProxyPool:
         """可用代理低于低水位时触发补池。"""
         return len(self._available) < self.settings.pool_low_water
 
-    def _sweep_cooldown(self):
-        """冷却到期的代理重新放回可用池（不再额外探测，靠真实请求验证）。"""
-        now = time.time()
-        expired = [p for p, c in self._cooldown.items() if c["until"] <= now]
-        for p in expired:
-            info = self._cooldown.pop(p)
-            if p not in self._available:
-                self._available[p] = {"quality": info.get("quality", "")}
-
     def _mark_cooldown(self, proxy: str, quality: str = ""):
-        """进入冷却：指数退避 60s*2^strike，上限 10min。"""
-        cur = self._cooldown.get(proxy, {"until": 0, "strike": 0, "quality": quality})
-        strike = cur.get("strike", 0)
-        delay = min(60 * (2 ** strike), 600)
-        self._cooldown[proxy] = {
-            "until": time.time() + delay,
-            "strike": strike + 1,
-            "quality": quality,
-        }
+        """进入冷却：指数退避 60s*2^strike，上限 10min（store TTL）。"""
+        val = self._store.get(_K_COOLDOWN + proxy)
+        # 无记忆取数时按 strike=0 起步
+        cur_strike = 0
+        if val:
+            try:
+                cur_strike = int(str(val).split(":")[0])
+            except (TypeError, ValueError):
+                cur_strike = 0
+        delay = min(60 * (2 ** cur_strike), 600)
+        self._store.setex(
+            _K_COOLDOWN + proxy, delay, f"{cur_strike + 1}:{quality}")
         self._available.pop(proxy, None)
+
+    def _in_cooldown(self, proxy: str) -> bool:
+        return self._store.exists(_K_COOLDOWN + proxy)
 
     async def _refill(self):
         """补池：按档位降级链取候选，并发做最小 chat 探测。
@@ -173,7 +172,7 @@ class ProxyPool:
                 continue
             new_ip = [
                 p for p in raw
-                if p not in self._available and p not in self._cooldown
+                if p not in self._available and not self._in_cooldown(p)
             ]
             if not new_ip:
                 continue

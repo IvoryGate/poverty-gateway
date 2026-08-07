@@ -83,6 +83,14 @@ class Settings:
         # 限流窗口（秒）
         self.rate_limit_window = self._get_int("RATE_LIMIT_WINDOW", 60)
 
+        # Redis 共享状态地址（多 worker 用）。空 = 单进程内存态
+        self.redis_url = self._get("REDIS_URL", "")
+
+        # 熔断：窗口内失败次数达到阈值则短暂熔断，避免硬顶被限流的上游
+        self.cb_window = self._get_int("CB_WINDOW", 30)        # 统计窗口（秒）
+        self.cb_failure_threshold = self._get_int("CB_FAILURE_THRESHOLD", 10)
+        self.cb_open_seconds = self._get_int("CB_OPEN_SECONDS", 15)  # 熔断时长
+
         # 对外服务端口
         self.port = self._get_int("PORT", 8000)
 

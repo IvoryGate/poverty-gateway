@@ -2,14 +2,14 @@
 
 - 支持 OpenCode / Cursor / Codex 等标准的 `Authorization: Bearer <key>`。
 - 每 key 可配独立 rpm（requests per minute）；缺省用全局默认值。
-- 固定窗口计数：窗口内超限返回 429。
+- 固定窗口计数（Redis 共享，多 worker 一致）：窗口内超限返回 429。
 - /health 不鉴权（放给监控探活）。
 """
 
-import threading
 import time
 
 from app.config import Settings
+from app.core.redis_store import RedisStore
 
 
 class AuthError(Exception):
@@ -21,13 +21,11 @@ class RateLimitExceeded(Exception):
 
 
 class AuthManager:
-    def __init__(self, settings: Settings = None):
+    def __init__(self, settings: Settings = None, store: RedisStore = None):
         self.settings = settings or Settings()
         # key -> {"name": str, "rpm": int}
         self._keys = dict(self.settings.api_keys or {})
-        # key -> (window_start, count)  固定窗口计数
-        self._windows: dict[str, tuple[float, int]] = {}
-        self._lock = threading.Lock()
+        self._store = store or RedisStore(settings)
 
     @property
     def enabled(self) -> bool:
@@ -57,19 +55,15 @@ class AuthManager:
         return None
 
     def _check_rate_limit(self, key: str):
-        """固定窗口限流：每 key 每窗口 rpm 次。"""
+        """固定窗口限流：每 key 每窗口 rpm 次（Redis 原子计数）。"""
         rpm = self._keys[key].get("rpm") or self.settings.api_key_default_rpm
         if rpm <= 0:
             return  # rpm=0 表示不限额
         window = self.settings.rate_limit_window
         now = time.time()
-        with self._lock:
-            start, count = self._windows.get(key, (0, 0))
-            if now - start >= window:
-                # 新窗口
-                self._windows[key] = (now, 1)
-                return
-            if count >= rpm:
-                raise RateLimitExceeded(
-                    f"rate limit exceeded ({rpm}/min)")
-            self._windows[key] = (start, count + 1)
+        bucket = f"rl:{key}:{int(now // window)}"
+        count = self._store.incr_window(bucket, window)
+        if count > rpm:
+            raise RateLimitExceeded(
+                f"rate limit exceeded ({rpm}/min)")
+

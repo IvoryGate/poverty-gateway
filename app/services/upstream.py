@@ -3,6 +3,8 @@
 只经代理转发（proxy_pool.get_proxy()），绝不直连。
 """
 
+import time
+
 import httpx
 
 from app.config import Settings
@@ -15,17 +17,35 @@ from app.core.proxy_pool import (
     NoProxyAvailable,
     ProxyPool,
 )
+from app.core.redis_store import RedisStore
 
 MAX_RETRIES = 5
+
+_CB_FAIL = "cb:fail:"    # 失败计数窗口桶
+_CB_OPEN = "cb:open"     # 熔断开关
 
 
 class UpstreamClient:
     """转发器：把 /v1/chat/completions 请求经代理发到上游。"""
 
-    def __init__(self, settings: Settings = None):
+    def __init__(self, settings: Settings = None, store: RedisStore = None):
         self.settings = settings or Settings()
         self.pool = ProxyPool(settings)
         self.models = ModelMapper(settings)
+        self._store = store or RedisStore(settings)
+
+    def _circuit_open(self) -> bool:
+        """熔断是否打开：打开则快速失败，避免硬顶被限流的上游。"""
+        return self._store.circuit_open(_CB_OPEN)
+
+    def _register_failure(self):
+        """记录一次上游失败（429/5xx），超过阈值触发熔断。"""
+        now = int(time.time())
+        bucket = f"{_CB_FAIL}{now // self.settings.cb_window}"
+        n = self._store.circuit_register_failure(
+            bucket, self.settings.cb_window + 5)
+        if n >= self.settings.cb_failure_threshold:
+            self._store.circuit_trip(_CB_OPEN, self.settings.cb_open_seconds)
 
     async def chat(self, public_model: str, payload: dict):
         """转发一次 chat completion（非流式）。
@@ -38,6 +58,9 @@ class UpstreamClient:
         - 连接失败     → 剔除该代理，换一个重试
         - 其他 4xx     → 参数问题，重试无意义，直接抛
         """
+        if self._circuit_open():
+            raise UpstreamError("upstream circuit open (too many failures)")
+
         upstream_model = self.models.to_upstream(public_model)
         payload = dict(payload)
         payload["model"] = upstream_model
@@ -56,6 +79,7 @@ class UpstreamClient:
                     # 非限流且非上游 5xx（如 4xx 参数问题）重试无意义
                     await self.pool.report(proxy, COOLDOWN)
                     raise
+                self._register_failure()
                 await self.pool.report(proxy, COOLDOWN)
                 excluded.add(proxy)
                 continue
@@ -74,6 +98,9 @@ class UpstreamClient:
         限流/5xx/连接失败在**首个块到达前**可换代理重试；
         一旦开始出流，错误只能透传/中断（响应头已定，无法重试）。
         """
+        if self._circuit_open():
+            raise UpstreamError("upstream circuit open (too many failures)")
+
         upstream_model = self.models.to_upstream(public_model)
         payload = dict(payload)
         payload["model"] = upstream_model
@@ -99,6 +126,7 @@ class UpstreamClient:
                 if "429" not in str(e) and not str(e).startswith("upstream 5"):
                     await self.pool.report(proxy, COOLDOWN)
                     raise
+                self._register_failure()
                 await self.pool.report(proxy, COOLDOWN)
                 excluded.add(proxy)
                 continue
