@@ -179,17 +179,17 @@ async def test_in_flight_counts_and_release():
 
 @pytest.mark.asyncio
 async def test_report_ok_resets_cooldown():
-    """冷却中的代理收到真实成功回写后回到可用池。"""
+    """冷却中的代理收到真实成功回写后清冷却，恢复可选。"""
     pool = make_pool(
         {"stable3": ["1.1.1.1:80"], "stable2": [], "stable1": []},
     )
     proxy = await pool.get_proxy()
     await pool.report(proxy, COOLDOWN)
     assert pool._store.exists("cooldown:" + proxy)
-    assert proxy not in pool._available
+    # 冷却中仍保留在 available，但 get_proxy 会过滤掉
     await pool.report(proxy, OK)
-    assert proxy in pool._available
     assert not pool._store.exists("cooldown:" + proxy)
+    assert proxy in pool._available
 
 
 @pytest.mark.asyncio
@@ -206,17 +206,17 @@ async def test_report_dead_removes():
 
 @pytest.mark.asyncio
 async def test_cooldown_expiry_allows_reuse():
-    """冷却 TTL 到期后该代理不再被屏蔽（可经补池重新纳入）。"""
+    """冷却 TTL 到期后该代理自动恢复可选（无需重新探测）。"""
     pool = make_pool(
         {"stable3": ["1.1.1.1:80"], "stable2": [], "stable1": []},
     )
     proxy = await pool.get_proxy()
     await pool.report(proxy, COOLDOWN)
     assert pool._store.exists("cooldown:" + proxy)
-    assert proxy not in pool._available
+    # 冷却期间不可选（低水位补池，但候选被冷却过滤）
+    with pytest.raises(NoProxyAvailable):
+        await pool.get_proxy()
     # 手动删除冷却键，模拟 TTL 到期
     pool._store.delete("cooldown:" + proxy)
-    # 低水位触发补池：探测通过后该代理重新入池
     got = await pool.get_proxy()
     assert got == proxy
-    assert proxy in pool._available

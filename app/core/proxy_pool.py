@@ -88,19 +88,17 @@ class ProxyPool:
                 and not self._store.exists(_K_COOLDOWN + p)
             ]
             if not candidates:
-                # 全部在途满/冷却/被排除：取最空闲且未冷却的兜底
+                # 全部在途满/冷却/被排除：取最空闲且未冷却的兜底（宁缺毋滥，不选冷却 IP）
                 candidates = [
                     p for p in self._available
                     if p not in exclude and not self._store.exists(_K_COOLDOWN + p)
                 ]
             if not candidates:
-                # 冷却区排除了全部：退回全部可用池挑最空闲（本次请求兜底）
-                candidates = list(self._available)
-            if not candidates:
                 self._metrics["no_proxy_errors"] += 1
                 raise NoProxyAvailable("代理池无可用代理（全部被排除）")
             pick = min(candidates, key=lambda p: _as_int(self._store.get(_K_INFLIGHT + p)))
-            self._store.incr(_K_INFLIGHT + pick)
+            # TTL 兜底：任何泄漏（异常/未归还）的计数 10 分钟后自动清除
+            self._store.incr(_K_INFLIGHT + pick, ttl=600)
             return pick
 
     def release(self, proxy: str):
@@ -146,7 +144,11 @@ class ProxyPool:
         return len(self._available) < self.settings.pool_low_water
 
     def _mark_cooldown(self, proxy: str, quality: str = ""):
-        """进入冷却：指数退避 60s*2^strike，上限 10min（store TTL）。"""
+        """进入冷却：指数退避 60s*2^strike，上限 10min（store TTL）。
+
+        冷却中的 IP 保留在 _available（避免池子缩水），但 get_proxy 会过滤
+        冷却键；冷却键过期后 IP 自动恢复可选，无需额外回池逻辑。
+        """
         val = self._store.get(_K_COOLDOWN + proxy)
         # 无记忆取数时按 strike=0 起步
         cur_strike = 0
@@ -158,7 +160,8 @@ class ProxyPool:
         delay = min(60 * (2 ** cur_strike), 600)
         self._store.setex(
             _K_COOLDOWN + proxy, delay, f"{cur_strike + 1}:{quality}")
-        self._available.pop(proxy, None)
+        if proxy not in self._available:
+            self._available[proxy] = {"quality": quality}
 
     def _in_cooldown(self, proxy: str) -> bool:
         return self._store.exists(_K_COOLDOWN + proxy)

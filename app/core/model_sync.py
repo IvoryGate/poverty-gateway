@@ -94,6 +94,8 @@ class ModelSync:
             return [i for i in ids if "-free" in i]
         except httpx.HTTPError:
             return []
+        finally:
+            pool.release(pool_proxy)
 
     async def _probe_model(self, model: str) -> bool:
         """经代理池对单个模型做最小 chat 探测（能出对话即可用）。"""
@@ -116,6 +118,8 @@ class ModelSync:
             return r.status_code == 200
         except httpx.HTTPError:
             return False
+        finally:
+            pool.release(proxy)
 
     async def run_forever(self):
         """后台循环：定期同步（多 worker 用 Redis 锁只让一个执行）。"""

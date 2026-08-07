@@ -50,14 +50,19 @@ class RedisStore:
         self._mem_ts[bucket] = now + ttl
         return self._memory[bucket]
 
-    def incr(self, key: str) -> int:
-        """无条件自增（in-flight 用）。"""
+    def incr(self, key: str, ttl: int = 0) -> int:
+        """无条件自增（in-flight 用）。ttl>0 时带过期兜底防泄漏。"""
         if self._client is not None:
             try:
-                return self._client.incr(key)
+                n = self._client.incr(key)
+                if ttl > 0 and n == 1:
+                    self._client.expire(key, ttl)
+                return n
             except redis.RedisError:
                 self._client = None
         self._memory[key] = self._memory.get(key, 0) + 1
+        if ttl > 0:
+            self._mem_ts[key] = time.time() + ttl
         return self._memory[key]
 
     def decr(self, key: str) -> int:
