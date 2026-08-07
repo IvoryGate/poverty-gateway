@@ -1,30 +1,21 @@
 """OpenAI 兼容路由：/v1/models、/v1/chat/completions、/health。
 
-对外形态与 OpenAI API 一致，便于 Cursor / Codex / Continue 等直接接入。
+设计原则：**宽松透传**——请求体以原始 dict 接收，只校验 model/messages 必需，
+其余字段（tools、tool_choice、reasoning_effort、stream_options、stop、n 等）
+原样保留并转发给上游。这样才能兼容 Cursor / Codex / opencode / Trae 等
+主流 OpenAI 兼容工具，它们能用的能力我们也能用。
 """
+
+import json
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
 
 from app.core.model_map import ModelMapper
 from app.core.proxy_pool import NoProxyAvailable
 from app.services.upstream import UpstreamClient, UpstreamError
 
 router = APIRouter()
-
-
-class ChatMessage(BaseModel):
-    role: str
-    content: str
-
-
-class ChatRequest(BaseModel):
-    model: str
-    messages: list[ChatMessage]
-    temperature: float | None = Field(default=None)
-    max_tokens: int | None = Field(default=None)
-    stream: bool | None = Field(default=False)
 
 
 @router.get("/v1/models")
@@ -34,13 +25,26 @@ async def list_models(request: Request):
 
 
 @router.post("/v1/chat/completions")
-async def chat_completions(req: ChatRequest, request: Request):
+async def chat_completions(request: Request):
     client: UpstreamClient = request.app.state.upstream
-    payload = req.model_dump(exclude_none=True)
-    if req.stream:
-        return await _stream_completions(client, req.model, payload)
     try:
-        result = await client.chat(req.model, payload)
+        payload = await request.json()
+    except (json.JSONDecodeError, ValueError, UnicodeDecodeError):
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Body must be a JSON object")
+
+    model = payload.get("model")
+    if not isinstance(model, str):
+        raise HTTPException(status_code=400, detail="field 'model' is required")
+    if not isinstance(payload.get("messages"), list) or not payload["messages"]:
+        raise HTTPException(status_code=400, detail="field 'messages' is required")
+
+    if payload.get("stream"):
+        return await _stream_completions(client, model, payload)
+
+    try:
+        result = await client.chat(model, payload)
     except KeyError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except NoProxyAvailable as e:
@@ -73,7 +77,6 @@ async def _stream_completions(client: UpstreamClient, model: str, payload: dict)
 
 def _sse_error(message: str) -> bytes:
     """把错误编码为 SSE error 事件（兼容 OpenAI 客户端解析）。"""
-    import json
     body = {"error": {"message": message, "type": "proxy_pool_error"}}
     return f"data: {json.dumps(body)}\n\n".encode()
 

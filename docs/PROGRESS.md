@@ -11,7 +11,9 @@
 > systemd 托管（开机自启 + 崩溃自愈）。
 > SSE 流式透传：stream=true 逐块转发（nginx 关缓冲 + httpx 流式读取），
 > 首块前可重试、出流后透传中断；deepseek/mimo/longcat 实测正常流式。
-> 实测：三个模型经域名 HTTPS 全通，17 测试通过 + ruff 全过。
+> OpenAI 兼容宽松透传：请求体原样透传（tools/reasoning_effort/stream_options），
+> 实测工具调用返回 finish_reason:tool_calls + get_weather({"city":"北京"})。
+> 实测：三个模型经域名 HTTPS 全通，20 测试通过 + ruff 全过。
 
 ## 阶段总览
 

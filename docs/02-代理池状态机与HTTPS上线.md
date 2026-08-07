@@ -66,6 +66,27 @@
 - 网关改为**只监听 127.0.0.1**，仅经 nginx 出入，杜绝裸奔公网直连
 - systemd 托管 `poverty-gateway.service`：开机自启 + `Restart=always` 崩溃自愈
 
+### 6. OpenAI 兼容宽松透传（工具调用支持）
+
+**背景**：原路由用严格 pydantic 模型（`ChatRequest`），`tools`/`tool_choice`/
+`reasoning_effort`/`stream_options` 等字段会被静默丢弃——主流 OpenAI 兼容工具
+（Cursor/Codex/opencode/Trae/WorkBuddy）的 **agent 工具调用能力会坏**。
+
+**改造**：请求体以原始 dict 接收，只校验 `model`/`messages` 必需，
+其余字段**原样保留**转发上游。彻底放开，兼容所有 OpenAI 标准客户端。
+
+**实测**（经域名）：
+- `tools` + `reasoning_effort` 透传成功，上游返回 `finish_reason: tool_calls` +
+  `get_weather({"city":"北京"})` —— 结构化工具调用正常
+- 流式下 tool_calls 分块透传正常
+- `reasoning_effort` 映射自客户端 variant（default/low/max），随请求发出
+
+**OpenCode 机制调研结论**：
+- cost/上下文统计：客户端本地算（上游响应 usage 字段 × 本地定价表），**不随请求发出**
+- variants（default/low/high）：客户端把 `reasoningEffort` 序列化为请求体
+  `reasoning_effort` 字段，**随请求发出**
+- 网关只需透明透传，无需实现统计/变体逻辑
+
 ### 5. SSE 流式透传
 
 - `UpstreamClient.chat_stream()`：`httpx` 流式读取上游 SSE，逐块产出原始字节
@@ -112,7 +133,7 @@ sudo systemctl enable poverty-gateway
 sudo systemctl start poverty-gateway
 
 # 测试
-python -m pytest   # 17 passed
+python -m pytest   # 20 passed
 ruff check .       # clean
 curl https://api.pixelreeds.com/v1/models
 ```
