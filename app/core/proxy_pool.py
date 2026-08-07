@@ -105,8 +105,12 @@ class ProxyPool:
         """请求结束（无论成败）归还 in-flight 计数。"""
         self._store.decr(_K_INFLIGHT + proxy)
 
-    async def report(self, proxy: str, status: str):
-        """真实请求结果回写池状态（隐式探测，不额外消耗上游）。"""
+    async def report(self, proxy: str, status: str, cooldown_seconds: int = 0):
+        """真实请求结果回写池状态（隐式探测，不额外消耗上游）。
+
+        cooldown_seconds: 429 时上游返回的解封秒数（retry-after），
+        有则用它精确设定冷却时长，到期第一时间复活。
+        """
         async with self._lock:
             self._store.decr(_K_INFLIGHT + proxy)
             if status == OK:
@@ -115,7 +119,7 @@ class ProxyPool:
                     self._available[proxy] = {"quality": ""}
             elif status == COOLDOWN:
                 self._metrics["cooldown_reports"] += 1
-                self._mark_cooldown(proxy)
+                self._mark_cooldown(proxy, cooldown_seconds=cooldown_seconds)
             elif status == DEAD:
                 self._metrics["dead_reports"] += 1
                 self._available.pop(proxy, None)
@@ -143,23 +147,27 @@ class ProxyPool:
         """可用代理低于低水位时触发补池。"""
         return len(self._available) < self.settings.pool_low_water
 
-    def _mark_cooldown(self, proxy: str, quality: str = ""):
-        """进入冷却：指数退避 60s*2^strike，上限 10min（store TTL）。
+    def _mark_cooldown(self, proxy: str, quality: str = "",
+                       cooldown_seconds: int = 0):
+        """进入冷却：优先用上游 retry-after 解封时间，否则指数退避。
 
         冷却中的 IP 保留在 _available（避免池子缩水），但 get_proxy 会过滤
         冷却键；冷却键过期后 IP 自动恢复可选，无需额外回池逻辑。
         """
-        val = self._store.get(_K_COOLDOWN + proxy)
-        # 无记忆取数时按 strike=0 起步
-        cur_strike = 0
-        if val:
-            try:
-                cur_strike = int(str(val).split(":")[0])
-            except (TypeError, ValueError):
-                cur_strike = 0
-        delay = min(60 * (2 ** cur_strike), 600)
-        self._store.setex(
-            _K_COOLDOWN + proxy, delay, f"{cur_strike + 1}:{quality}")
+        if cooldown_seconds and cooldown_seconds > 0:
+            delay = min(cooldown_seconds, 86400)  # 上限 24h 防异常值
+            self._store.setex(_K_COOLDOWN + proxy, delay, f"0:{quality}")
+        else:
+            val = self._store.get(_K_COOLDOWN + proxy)
+            cur_strike = 0
+            if val:
+                try:
+                    cur_strike = int(str(val).split(":")[0])
+                except (TypeError, ValueError):
+                    cur_strike = 0
+            delay = min(60 * (2 ** cur_strike), 600)
+            self._store.setex(
+                _K_COOLDOWN + proxy, delay, f"{cur_strike + 1}:{quality}")
         if proxy not in self._available:
             self._available[proxy] = {"quality": quality}
 

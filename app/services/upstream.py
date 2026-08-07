@@ -78,10 +78,10 @@ class UpstreamClient:
                 last_err = e
                 if "429" not in str(e) and not str(e).startswith("upstream 5"):
                     # 非限流且非上游 5xx（如 4xx 参数问题）重试无意义
-                    await self.pool.report(proxy, COOLDOWN)
+                    await self.pool.report(proxy, COOLDOWN, cooldown_seconds=e.retry_after)
                     raise
                 self._register_failure()
-                await self.pool.report(proxy, COOLDOWN)
+                await self.pool.report(proxy, COOLDOWN, cooldown_seconds=e.retry_after)
                 excluded.add(proxy)
                 continue
             except httpx.HTTPError as e:
@@ -122,13 +122,13 @@ class UpstreamClient:
                 last_err = e
                 if started:
                     # 已在出流中途失败：无法重试，标记状态后抛
-                    await self.pool.report(proxy, COOLDOWN)
+                    await self.pool.report(proxy, COOLDOWN, cooldown_seconds=e.retry_after)
                     raise
                 if "429" not in str(e) and not str(e).startswith("upstream 5"):
-                    await self.pool.report(proxy, COOLDOWN)
+                    await self.pool.report(proxy, COOLDOWN, cooldown_seconds=e.retry_after)
                     raise
                 self._register_failure()
-                await self.pool.report(proxy, COOLDOWN)
+                await self.pool.report(proxy, COOLDOWN, cooldown_seconds=e.retry_after)
                 excluded.add(proxy)
                 continue
             except httpx.HTTPError as e:
@@ -153,7 +153,10 @@ class UpstreamClient:
             if r.status_code >= 400:
                 body = await r.aread()
                 detail = body[:500].decode("utf-8", errors="replace")
-                raise UpstreamError(f"upstream {r.status_code}: {detail}")
+                raise UpstreamError(
+                    f"upstream {r.status_code}: {detail}",
+                    retry_after=_parse_retry_after(r),
+                )
             async for chunk in r.aiter_bytes():
                 yield chunk
 
@@ -168,7 +171,10 @@ class UpstreamClient:
             )
         if r.status_code >= 400:
             detail = r.text[:500]
-            raise UpstreamError(f"upstream {r.status_code}: {detail}")
+            raise UpstreamError(
+                f"upstream {r.status_code}: {detail}",
+                retry_after=_parse_retry_after(r),
+            )
         return r.json()
 
     async def health(self) -> dict:
@@ -201,3 +207,18 @@ class UpstreamClient:
 
 class UpstreamError(Exception):
     """上游返回错误。"""
+
+    def __init__(self, message: str, retry_after: int = 0):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+def _parse_retry_after(r) -> int:
+    """解析 429 响应的 retry-after 头（秒）。无则返回 0。"""
+    val = r.headers.get("retry-after")
+    if not val:
+        return 0
+    try:
+        return max(int(val.strip()), 0)
+    except (TypeError, ValueError):
+        return 0

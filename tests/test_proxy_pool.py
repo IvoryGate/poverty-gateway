@@ -205,6 +205,24 @@ async def test_report_dead_removes():
 
 
 @pytest.mark.asyncio
+async def test_cooldown_uses_retry_after():
+    """429 带上游 retry-after 时，冷却时长用上游解封时间。"""
+    pool = make_pool(
+        {"stable3": ["1.1.1.1:80", "2.2.2.2:80"], "stable2": [], "stable1": []},
+    )
+    proxy = await pool.get_proxy()
+    await pool.report(proxy, COOLDOWN, cooldown_seconds=3600)
+    # 冷却键应带 3600s TTL（memory 态通过 _mem_ts 判断）
+    ts = pool._store._mem_ts.get("cooldown:" + proxy, 0)
+    assert ts > 0
+    # 无 retry_after 时走指数退避（约 60s）
+    proxy2 = await pool.get_proxy()
+    await pool.report(proxy2, COOLDOWN)
+    ts2 = pool._store._mem_ts.get("cooldown:" + proxy2, 0)
+    assert 0 < ts2 < ts
+
+
+@pytest.mark.asyncio
 async def test_cooldown_expiry_allows_reuse():
     """冷却 TTL 到期后该代理自动恢复可选（无需重新探测）。"""
     pool = make_pool(
