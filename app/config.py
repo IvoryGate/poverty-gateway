@@ -1,5 +1,6 @@
 """全局配置：所有可从环境变量覆盖的运行时参数。"""
 
+import json
 import os
 
 
@@ -66,8 +67,61 @@ class Settings:
         # 单个 IP 最大在途并发：超过则取号时跳过，避免同 IP 被打爆
         self.max_in_flight = self._get_int("MAX_IN_FLIGHT", 3)
 
+        # API-Key 鉴权：是否启用（默认启用；测试可关）
+        self.auth_enabled = self._get_bool("AUTH_ENABLED", True)
+
+        # API-Key 列表（JSON 字符串或文件）：key -> {name, rpm}
+        # 例: {"sk-xxx1": {"name": "alice", "rpm": 60}, "sk-xxx2": {"name": "bob", "rpm": 30}}
+        # rpm = 每分钟最大请求数；缺省用默认 rpm。
+        # 两种来源：API_KEYS 环境变量（JSON 字符串）或 API_KEYS_FILE（指向 JSON 文件）。
+        self.api_keys = self._parse_api_keys(
+            self._get("API_KEYS", "") or self._read_keys_file(self._get("API_KEYS_FILE", ""))
+        )
+        # 每 key 默认限流（每分钟请求数）
+        self.api_key_default_rpm = self._get_int("API_KEY_DEFAULT_RPM", 60)
+
+        # 限流窗口（秒）
+        self.rate_limit_window = self._get_int("RATE_LIMIT_WINDOW", 60)
+
         # 对外服务端口
         self.port = self._get_int("PORT", 8000)
+
+    @staticmethod
+    def _read_keys_file(path: str) -> str:
+        if not path:
+            return ""
+        try:
+            with open(path, encoding="utf-8") as f:
+                return f.read()
+        except OSError:
+            return ""
+
+    @staticmethod
+    def _parse_api_keys(raw) -> dict:
+        """解析 API_KEYS 为 {key: {"name": str, "rpm": int}}。
+
+        兼容两种输入：JSON 字符串（环境变量）或 dict（测试覆盖）。
+        """
+        if not raw:
+            return {}
+        if isinstance(raw, dict):
+            data = raw
+        else:
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                return {}
+        if not isinstance(data, dict):
+            return {}
+        keys = {}
+        for k, v in data.items():
+            if not isinstance(v, dict):
+                v = {}
+            keys[k] = {
+                "name": str(v.get("name", "")),
+                "rpm": int(v.get("rpm", 0)),
+            }
+        return keys
 
     def _get(self, key, default):
         # 支持两种 override key：环境变量名（大写）或属性名（小写）
@@ -87,3 +141,12 @@ class Settings:
         if attr in self._overrides:
             return float(self._overrides[attr])
         return _env_float(key, default)
+
+    def _get_bool(self, key, default):
+        attr = key.lower()
+        if attr in self._overrides:
+            v = self._overrides[attr]
+            if isinstance(v, bool):
+                return v
+            return str(v).lower() in ("1", "true", "yes", "on")
+        return _env_bool(key, default)

@@ -2,18 +2,13 @@
 
 ## 当前进度
 
-**阶段 02 完成（代理池状态机 + HTTPS 上线）**
-> 代理池从"快照式缓存"重构为**状态机**：可用/冷却/剔除三态，每个 IP 只有通过
-> **最小 chat 探测**（能出对话）才算可用。
-> 主动探测只在冷启动/低水位触发，稳态靠**真实请求回写**维持新鲜度（探测成本≈0）。
-> 冷却指数退避（60s×2ⁿ，上限 10min）+ in-flight 并发控制（避免多 key 撞同一 IP）。
-> HTTPS 上线：nginx 反代 `https://api.pixelreeds.com` + 通配证书，网关只监听 127.0.0.1，
-> systemd 托管（开机自启 + 崩溃自愈）。
-> SSE 流式透传：stream=true 逐块转发（nginx 关缓冲 + httpx 流式读取），
-> 首块前可重试、出流后透传中断；deepseek/mimo/longcat 实测正常流式。
-> OpenAI 兼容宽松透传：请求体原样透传（tools/reasoning_effort/stream_options），
-> 实测工具调用返回 finish_reason:tool_calls + get_weather({"city":"北京"})。
-> 实测：三个模型经域名 HTTPS 全通，20 测试通过 + ruff 全过。
+**阶段 03 完成（API-Key 鉴权 + 每 key 限流）**
+> OpenAI 标准 `Authorization: Bearer <key>` 鉴权，/v1/models 与 /v1/chat/completions
+> 需 key，/health 放开（监控探活）。
+> 每 key 独立 rpm（固定窗口计数）：matrix:120 / dev:60 / ci:30，超限 429。
+> key 存 /etc/poverty-gateway/keys.json（不进 git），systemd 环境变量注入。
+> 实测：无 key 401、错误 key 401、正确 key 200、rpm=1 测试 key 第2次起 429。
+> 33 测试通过 + ruff 全过。
 
 ## 阶段总览
 
@@ -22,11 +17,11 @@
 | 00 | 项目初始化 | [`00-项目初始化.md`](./00-项目初始化.md) | ✅ |
 | 01 | 代理池取用模块 | [`01-代理池取用模块.md`](./01-代理池取用模块.md) | ✅ |
 | 02 | 代理池状态机 + HTTPS 上线 | [`02-代理池状态机与HTTPS上线.md`](./02-代理池状态机与HTTPS上线.md) | ✅ |
+| 03 | API-Key 鉴权 + 每 key 限流 | [`03-API-Key鉴权与限流.md`](./03-API-Key鉴权与限流.md) | ✅ |
 
 ---
 
 ## 待办 / 下一步
 
-- 阶段 03：API-Key 鉴权 + 多 key + 每 key 限流（对外提供 3-5 个 key 的前提）
-- 阶段 04：用量统计（请求/token/延迟/每 key）
-- 若 uvicorn 开多 worker：in-flight 计数需落 Redis（当前为进程内存态）
+- 阶段 04：用量统计（请求/token/延迟/每 key 维度）
+- 若 uvicorn 开多 worker：限流/in-flight 计数需落 Redis（当前为进程内存态）

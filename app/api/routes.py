@@ -8,9 +8,10 @@
 
 import json
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
+from app.core.auth import AuthError, AuthManager, RateLimitExceeded
 from app.core.model_map import ModelMapper
 from app.core.proxy_pool import NoProxyAvailable
 from app.services.upstream import UpstreamClient, UpstreamError
@@ -18,14 +19,27 @@ from app.services.upstream import UpstreamClient, UpstreamError
 router = APIRouter()
 
 
+def _require_key(request: Request) -> str:
+    """鉴权依赖：校验 Bearer key，返回 key 字符串。失败抛 401/429。"""
+    auth: AuthManager = request.app.state.auth
+    if not auth.enabled:
+        return "anonymous"
+    try:
+        return auth.authenticate(request.headers.get("Authorization"))
+    except AuthError as e:
+        raise HTTPException(status_code=401, detail=str(e))
+    except RateLimitExceeded as e:
+        raise HTTPException(status_code=429, detail=str(e))
+
+
 @router.get("/v1/models")
-async def list_models(request: Request):
+async def list_models(request: Request, _key: str = Depends(_require_key)):
     mapper = ModelMapper(request.app.state.settings)
     return {"object": "list", "data": mapper.list_public()}
 
 
 @router.post("/v1/chat/completions")
-async def chat_completions(request: Request):
+async def chat_completions(request: Request, _key: str = Depends(_require_key)):
     client: UpstreamClient = request.app.state.upstream
     try:
         payload = await request.json()

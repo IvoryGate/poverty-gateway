@@ -13,13 +13,16 @@ from app.main import create_app
 from app.services.upstream import UpstreamClient
 
 
-def make_app(upstream_handler, proxies=None):
+def make_app(upstream_handler, proxies=None, api_keys=None):
     """构造 app：代理池探活放行、上游用 MockTransport 模拟。"""
 
     async def probe_fn(proxy: str) -> str:
         return "ok"
 
     proxies = proxies or ["1.1.1.1:80"]
+    api_keys = api_keys or {
+        "sk-alice": {"name": "alice", "rpm": 3},
+    }
 
     def pool_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"code": 200, "data": proxies})
@@ -36,6 +39,10 @@ def make_app(upstream_handler, proxies=None):
         pool_low_water=1,
         pool_target=2,
         max_in_flight=3,
+        api_keys=api_keys,
+        auth_enabled=True,
+        api_key_default_rpm=60,
+        rate_limit_window=60,
     )
 
     # 替换 UpstreamClient 的 _request，用 MockTransport 模拟上游
@@ -79,7 +86,8 @@ async def test_extra_fields_passthrough():
     app = make_app(handler)
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
-        r = await ac.post("/v1/chat/completions", json={
+        r = await ac.post("/v1/chat/completions",
+                          headers={"Authorization": "Bearer sk-alice"}, json={
             "model": "deepseek-v4-flash-free",
             "messages": [{"role": "user", "content": "hi"}],
             "reasoning_effort": "low",
@@ -106,7 +114,8 @@ async def test_missing_model_rejected():
     app = make_app(handler)
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
-        r = await ac.post("/v1/chat/completions", json={
+        r = await ac.post("/v1/chat/completions",
+                          headers={"Authorization": "Bearer sk-alice"}, json={
             "messages": [{"role": "user", "content": "hi"}]})
     assert r.status_code == 400
 
@@ -120,7 +129,73 @@ async def test_unknown_model_404():
     app = make_app(handler)
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
-        r = await ac.post("/v1/chat/completions", json={
+        r = await ac.post("/v1/chat/completions",
+                          headers={"Authorization": "Bearer sk-alice"}, json={
             "model": "no-such-model",
             "messages": [{"role": "user", "content": "hi"}]})
     assert r.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_auth_required():
+    """无 API key → 401。"""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={})
+
+    app = make_app(handler)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        r = await ac.post("/v1/chat/completions", json={
+            "model": "deepseek-v4-flash-free",
+            "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_auth_valid_key_passes():
+    """有效 API key → 正常转发。"""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={
+            "id": "x", "object": "chat.completion", "created": 0,
+            "model": "deepseek-v4-flash-free",
+            "choices": [{"index": 0, "finish_reason": "stop",
+                         "message": {"role": "assistant", "content": "ok"}}],
+        })
+
+    app = make_app(handler)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        r = await ac.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer sk-alice"},
+            json={"model": "deepseek-v4-flash-free",
+                  "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_429():
+    """每 key rpm 用尽 → 429。"""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={
+            "id": "x", "object": "chat.completion", "created": 0,
+            "model": "deepseek-v4-flash-free",
+            "choices": [{"index": 0, "finish_reason": "stop",
+                         "message": {"role": "assistant", "content": "ok"}}],
+        })
+
+    app = make_app(handler)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        for _ in range(3):
+            r = await ac.post(
+                "/v1/chat/completions",
+                headers={"Authorization": "Bearer sk-alice"},
+                json={"model": "deepseek-v4-flash-free",
+                      "messages": [{"role": "user", "content": "hi"}]})
+        r = await ac.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer sk-alice"},
+            json={"model": "deepseek-v4-flash-free",
+                  "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 429
