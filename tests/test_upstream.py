@@ -8,7 +8,7 @@ import pytest
 
 from app.config import Settings
 from app.core.proxy_pool import ProxyPool
-from app.services.upstream import UpstreamClient, UpstreamError
+from app.services.upstream import UpstreamClient, UpstreamError, _sanitize_responses
 
 
 def make_settings(**kw):
@@ -49,7 +49,7 @@ def make_client(upstream_handler, proxy_probes="ok", proxies=None):
     client = UpstreamClient(settings)
     client.pool = pool
 
-    async def _fake_stream(proxy: str, payload: dict):
+    async def _fake_stream(endpoint: str, proxy: str, payload: dict):
         r = upstream_handler(httpx.Request("POST", "https://upstream.test"))
         if r.status_code >= 400:
             raise UpstreamError(f"upstream {r.status_code}: {r.text[:200]}")
@@ -166,3 +166,57 @@ async def test_circuit_breaker_trips_on_many_failures():
         async for _ in client.chat_stream(
                 "deepseek-v4-flash-free", {"model": "x"}):
             pass
+
+
+def test_sanitize_responses_removes_web_search():
+    """responses 请求剔除 web_search 等 zen 不支持的工具。"""
+    payload = {
+        "tools": [
+            {"type": "function", "name": "exec", "description": "run"},
+            {"type": "namespace", "name": "multi_agent_v1", "tools": []},
+            {"type": "web_search", "external_web_access": False},
+            {"type": "builtin", "name": "something"},
+        ]
+    }
+    out = _sanitize_responses(payload)
+    types = [t["type"] for t in out["tools"]]
+    assert "web_search" not in types
+    assert "builtin" not in types
+    assert "function" in types
+    assert "namespace" in types
+
+
+def test_sanitize_responses_no_tools():
+    """无 tools 字段时原样返回。"""
+    payload = {"model": "x", "input": []}
+    out = _sanitize_responses(payload)
+    assert "tools" not in out
+    assert out["model"] == "x"
+
+
+def test_inject_responses_events_sequence():
+    """补齐 Codex 需要的事件序列。"""
+    from app.services.upstream import _inject_responses_events
+
+    state = {"started": False, "rid": None, "item_id": None}
+    events = []
+
+    def feed(t, d):
+        for name, obj in _inject_responses_events((t, d), state):
+            events.append((name, obj))
+
+    # zen 只发 delta + completed
+    feed("response.output_text.delta", {
+        "id": "r1", "type": "response.output_text.delta",
+        "delta": "Hi", "response": {"id": "r1", "model": "m"}})
+    feed("response.output_text.delta", {
+        "id": "r1", "type": "response.output_text.delta",
+        "delta": " there", "response": {"id": "r1", "model": "m"}})
+    feed("response.completed", {
+        "id": "r1", "type": "response.completed",
+        "response": {"id": "r1", "model": "m"}})
+
+    names = [n for n, _ in events]
+    assert names == ["response.created", "response.output_item.added",
+                     "data", "data",
+                     "response.output_item.done", "data"]

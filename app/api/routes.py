@@ -33,17 +33,30 @@ def _require_key(request: Request) -> str:
         raise HTTPException(status_code=429, detail=str(e))
 
 
+def _models_response(client: UpstreamClient) -> dict:
+    """模型列表：同时兼容 OpenAI 标准（data）与 Codex 标准（models+slug）。"""
+    base = client.models.list_public()
+    data = base
+    # Codex 的 Models API 期望每个模型带 slug 等元数据
+    models = [
+        {"id": m["id"], "slug": m["id"], "object": "model",
+         "owned_by": "opencode"}
+        for m in data
+    ]
+    return {"object": "list", "data": data, "models": models}
+
+
 @router.get("/v1/models")
 async def list_models(request: Request, _key: str = Depends(_require_key)):
     client: UpstreamClient = request.app.state.upstream
-    return {"object": "list", "data": client.models.list_public()}
+    return _models_response(client)
 
 
 @router.get("/models")
 async def list_models_no_version(request: Request, _key: str = Depends(_require_key)):
     """兼容 baseURL 不带 /v1 的客户端。"""
     client: UpstreamClient = request.app.state.upstream
-    return {"object": "list", "data": client.models.list_public()}
+    return _models_response(client)
 
 
 @router.post("/v1/chat/completions")
@@ -55,6 +68,69 @@ async def chat_completions(request: Request, _key: str = Depends(_require_key)):
 async def chat_completions_no_version(request: Request, _key: str = Depends(_require_key)):
     """兼容 baseURL 不带 /v1 的客户端（@ai-sdk/openai-compatible 等）。"""
     return await _chat_completions(request, _key)
+
+
+@router.post("/v1/responses")
+async def responses(request: Request, _key: str = Depends(_require_key)):
+    """Responses API（Codex 用）：宽松透传到上游 /responses。"""
+    return await _responses(request, _key)
+
+
+@router.post("/responses")
+async def responses_no_version(request: Request, _key: str = Depends(_require_key)):
+    """兼容 baseURL 不带 /v1 的客户端。"""
+    return await _responses(request, _key)
+
+
+async def _responses(request: Request, key: str):
+    client: UpstreamClient = request.app.state.upstream
+    usage: UsageTracker = request.app.state.usage
+    try:
+        payload = await request.json()
+    except (json.JSONDecodeError, ValueError, UnicodeDecodeError):
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Body must be a JSON object")
+
+    model = payload.get("model")
+    if not isinstance(model, str):
+        raise HTTPException(status_code=400, detail="field 'model' is required")
+
+    t0 = time.time()
+    if payload.get("stream"):
+        async def gen():
+            ok = False
+            ti = to = 0
+            try:
+                async for chunk in client.responses_stream(model, payload):
+                    ok = True
+                    yield chunk
+                    ti, to = _scan_stream_usage(chunk, ti, to)
+            except KeyError as e:
+                yield _sse_error(f"Unknown model: {e}")
+            except NoProxyAvailable as e:
+                yield _sse_error(str(e))
+            except UpstreamError as e:
+                yield _sse_error(str(e))
+            finally:
+                usage.record(key, success=ok,
+                             latency_ms=(time.time() - t0) * 1000,
+                             tokens_in=ti, tokens_out=to)
+        return StreamingResponse(
+            gen(), media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    try:
+        result = await client.responses(model, payload)
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except NoProxyAvailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except UpstreamError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    usage.record(key, success=True, latency_ms=(time.time() - t0) * 1000)
+    return result
 
 
 async def _chat_completions(request: Request, key: str):

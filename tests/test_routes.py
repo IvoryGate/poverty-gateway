@@ -57,8 +57,8 @@ def make_app(upstream_handler, proxies=None, api_keys=None):
     upstream.pool = pool
 
     # 注入：把 _request 换成走 mock 的版本（真实 _request 走真代理无法 mock）
-    async def fake_request(proxy: str, payload: dict) -> dict:
-        r = await client.post("https://upstream.test/chat", json=payload)
+    async def fake_request(endpoint: str, proxy: str, payload: dict) -> dict:
+        r = await client.post(f"https://upstream.test/{endpoint}", json=payload)
         return r.json()
 
     upstream._request = fake_request  # type: ignore[method-assign]
@@ -224,6 +224,37 @@ async def test_no_version_endpoint_alias():
                           headers={"Authorization": "Bearer sk-alice"})
     assert r1.status_code == 200
     assert r2.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_responses_endpoint_passthrough():
+    """Responses API（Codex）透传到上游 /responses，model 替换为真实名。"""
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        import json
+        seen["url"] = str(request.url)
+        seen["payload"] = json.loads(request.content)
+        return httpx.Response(200, json={
+            "id": "resp_1", "object": "response", "created_at": 0,
+            "model": "deepseek-v4-flash-free",
+            "output": [{"type": "message",
+                        "content": [{"type": "output_text", "text": "ok"}]}],
+        })
+
+    app = make_app(handler)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        r = await ac.post(
+            "/v1/responses",
+            headers={"Authorization": "Bearer sk-alice"},
+            json={"model": "deepseek-v4-flash-free",
+                  "input": [{"role": "user",
+                             "content": [{"type": "input_text", "text": "hi"}]}]})
+    assert r.status_code == 200
+    assert "responses" in seen["url"]
+    assert seen["payload"]["model"] == "deepseek-v4-flash-free"
+    assert seen["payload"]["input"][0]["role"] == "user"
 
 
 @pytest.mark.asyncio
