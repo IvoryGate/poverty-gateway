@@ -141,7 +141,42 @@ async def test_refill_stops_at_target():
 
 @pytest.mark.asyncio
 async def test_refill_when_low_water():
-    """可用池低于 low_water 时补池。"""
+    """可用池低于 low_water 时触发补池（后台任务，单飞）。"""
+    get_calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url).startswith("http://pool.test/get"):
+            get_calls["n"] += 1
+        # 每次 /get 返回一个全新 IP：低水位补池才有新货可入池
+        return httpx.Response(200, json={"code": 200, "data": [f"{get_calls['n']}.1.1.1:80"]})
+
+    async def probe_fn(proxy: str) -> str:
+        return OK
+
+    transport = httpx.MockTransport(handler)
+    client = httpx.AsyncClient(transport=transport)
+    pool = ProxyPool(
+        make_settings(pool_target=2, pool_low_water=2, quality_chain="stable3"),
+        client=client, probe_fn=probe_fn,
+    )
+
+    # 冷启动：同步补池一次，首次 /get 返回 1.1.1.1
+    await pool.get_proxy()
+    assert get_calls["n"] == 1
+    assert pool._usable_count() == 1
+
+    # 低水位：触发后台补池，等待任务完成（第二次 /get 返回 2.1.1.1）
+    await pool.get_proxy()
+    task = pool._refill_task
+    if task is not None:
+        await task
+    assert get_calls["n"] == 2
+    assert pool._usable_count() >= 2
+
+
+@pytest.mark.asyncio
+async def test_schedule_refill_single_flight():
+    """低水位多次触发只跑一个后台补池任务。"""
     get_calls = {"n": 0}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -154,15 +189,24 @@ async def test_refill_when_low_water():
 
     transport = httpx.MockTransport(handler)
     client = httpx.AsyncClient(transport=transport)
-    # 池目标 2、低水位 2：每次取都会低于水位，应多次补池（链上只有 stable3）
     pool = ProxyPool(
         make_settings(pool_target=2, pool_low_water=2, quality_chain="stable3"),
         client=client, probe_fn=probe_fn,
     )
+    # 先完成冷启动补池
+    await pool.get_proxy()
+    if pool._refill_task is not None:
+        await pool._refill_task
+    calls_before = get_calls["n"]
 
-    await pool.get_proxy()
-    await pool.get_proxy()
-    assert get_calls["n"] == 2
+    # 连续两次低水位触发：应只启动一个后台任务
+    pool._schedule_refill()
+    first = pool._refill_task
+    pool._schedule_refill()
+    assert pool._refill_task is first  # 单飞：仍是同一个任务
+    if pool._refill_task is not None:
+        await pool._refill_task
+    assert get_calls["n"] > calls_before
 
 
 @pytest.mark.asyncio

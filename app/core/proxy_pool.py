@@ -15,12 +15,15 @@
 """
 
 import asyncio
+import logging
 
 import httpx
 
 from app.config import Settings
 from app.core.headers import zen_headers
 from app.core.redis_store import RedisStore
+
+logger = logging.getLogger(__name__)
 
 # 探测/回写状态常量
 OK = "ok"                 # 真实请求成功，可用
@@ -51,6 +54,8 @@ class ProxyPool:
                  probe_fn=None, store: RedisStore = None):
         self.settings = settings or Settings()
         self._lock = asyncio.Lock()
+        self._refill_lock = asyncio.Lock()      # 补池并入专用锁（避免与主锁死锁）
+        self._refill_task: asyncio.Task | None = None   # 后台补池任务（单飞）
         # 测试时可注入 MockTransport 的 client；probe_fn 可注入探活函数
         self._http = client or httpx.AsyncClient(timeout=10)
         self._probe_fn = probe_fn or self._probe
@@ -89,8 +94,10 @@ class ProxyPool:
         """
         exclude = exclude or set()
         async with self._lock:
-            if not self._warm or self._low_water():
+            if not self._warm:
                 await self._refill()
+            elif self._low_water():
+                self._schedule_refill()
             if not self._available:
                 self._metrics["no_proxy_errors"] += 1
                 raise NoProxyAvailable("代理池无可用代理")
@@ -168,9 +175,7 @@ class ProxyPool:
         in_flight = sum(_as_int(self._store.get(_K_INFLIGHT + p)) for p in self._available)
         cooldown_n = len(self._store.keys(_K_COOLDOWN + "*"))
         # 真实可用 = 不在冷却中的占位（冷却的不算可用）
-        usable = sum(
-            1 for p in self._available
-            if not self._store.exists(_K_COOLDOWN + p))
+        usable = self._usable_count()
         lat = sorted(self._latency.values()) if self._latency else []
         latency_median = lat[len(lat) // 2] if lat else 0.0
         return {
@@ -198,10 +203,13 @@ class ProxyPool:
         一直占着 _available 的位置导致计数虚高、不补池，真实可用持续缩水
         （面板 available 看着多，实际能用的一大半在冷却）。
         """
-        usable = sum(
+        return self._usable_count() < self.settings.pool_low_water
+
+    def _usable_count(self) -> int:
+        """真实可用数：_available 里不在冷却中的 IP 数。"""
+        return sum(
             1 for p in self._available
             if not self._store.exists(_K_COOLDOWN + p))
-        return usable < self.settings.pool_low_water
 
     def save_snapshot(self):
         """把当前可用池快照写入 Redis（优雅停机/定时落盘用）。
@@ -281,12 +289,34 @@ class ProxyPool:
     def _in_cooldown(self, proxy: str) -> bool:
         return self._store.exists(_K_COOLDOWN + proxy)
 
+    def _schedule_refill(self):
+        """低水位时触发后台补池（非阻塞，防 get_proxy 长时间持锁）。
+
+        单飞保护：同一时刻只有一个补池任务在跑，避免并发重复探测。
+        补池在后台探测，只短暂取锁把结果并入 _available，不影响取号。
+        """
+        if self._refill_task is not None and not self._refill_task.done():
+            return  # 已有补池在跑
+        task = asyncio.create_task(self._refill())
+        task.add_done_callback(self._refill_done)
+        self._refill_task = task
+
+    def _refill_done(self, task: asyncio.Task):
+        """补池结束回调：消费异常，避免 'Task exception was never retrieved' 刷屏。"""
+        if not task.cancelled() and task.exception() is not None:
+            logger.warning("后台补池异常: %r", task.exception())
+
     async def _refill(self):
-        """补池：按档位降级链取候选，分批探测直到达到 pool_target。
+        """补池：按档位降级链取候选，分批探测直到真实可用达标。
 
         只探测"当前既不在可用池、也不在冷却区"的新 IP，避免重复劳动。
         候选来自 Redis 全量（可能上百个），按 probe_batch 分片循环探测，
-        未达 target 则继续下一批，直到候选耗尽或达标。
+        直到"非冷却的可用 IP"达到 pool_target，或候选耗尽。
+
+        注意达标判断用"真实可用数"（排除冷却占位）：冷却中的 IP 进过池
+        就占着 _available 的位置，用它判断会提前停，导致可用数长期不足。
+
+        探测阶段不持主锁（get_proxy 用），只在并入 _available 时短暂取锁。
         """
         self._warm = True
         self._metrics["refill_count"] += 1
@@ -308,11 +338,13 @@ class ProxyPool:
                 chunk = pending[pos:pos + batch]
                 pos += batch
                 good = await self._probe_all(chunk, probe_conc, quality)
-                for p in good:
-                    self._available[p] = {"quality": quality}
-                if len(self._available) >= self.settings.pool_target:
+                if good:
+                    async with self._refill_lock:
+                        for p in good:
+                            self._available[p] = {"quality": quality}
+                if self._usable_count() >= self.settings.pool_target:
                     break
-            if len(self._available) >= self.settings.pool_target:
+            if self._usable_count() >= self.settings.pool_target:
                 break
 
     async def _fetch_candidates(self, quality: str) -> list[str]:
