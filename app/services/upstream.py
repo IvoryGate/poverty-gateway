@@ -109,6 +109,7 @@ class UpstreamClient:
                 return result
             except UpstreamError as e:
                 last_err = e
+                self.pool.note_error(_classify(e.status_code))
                 if "429" not in str(e) and not str(e).startswith("upstream 5"):
                     # 非限流且非上游 5xx（如 4xx 参数问题）重试无意义
                     await self.pool.report(proxy, COOLDOWN, cooldown_seconds=e.retry_after)
@@ -117,9 +118,17 @@ class UpstreamClient:
                 await self.pool.report(proxy, COOLDOWN, cooldown_seconds=e.retry_after)
                 excluded.add(proxy)
                 continue
+            except httpx.TimeoutException as e:
+                # 传输超时：代理慢/挂，剔除换一个（记入 timeout 桶）
+                last_err = e
+                self.pool.note_error("timeout")
+                await self.pool.report(proxy, DEAD)
+                excluded.add(proxy)
+                continue
             except httpx.HTTPError as e:
                 # 连接/传输层失败：该代理不可用，剔除后换一个
                 last_err = e
+                self.pool.note_error("conn")
                 await self.pool.report(proxy, DEAD)
                 excluded.add(proxy)
                 continue
@@ -160,6 +169,7 @@ class UpstreamClient:
                 return
             except UpstreamError as e:
                 last_err = e
+                self.pool.note_error(_classify(e.status_code))
                 if started:
                     # 已在出流中途失败：无法重试，标记状态后抛
                     await self.pool.report(proxy, COOLDOWN, cooldown_seconds=e.retry_after)
@@ -171,8 +181,17 @@ class UpstreamClient:
                 await self.pool.report(proxy, COOLDOWN, cooldown_seconds=e.retry_after)
                 excluded.add(proxy)
                 continue
+            except httpx.TimeoutException as e:
+                last_err = e
+                self.pool.note_error("timeout")
+                await self.pool.report(proxy, DEAD)
+                if started:
+                    raise
+                excluded.add(proxy)
+                continue
             except httpx.HTTPError as e:
                 last_err = e
+                self.pool.note_error("conn")
                 await self.pool.report(proxy, DEAD)
                 if started:
                     raise
@@ -194,6 +213,7 @@ class UpstreamClient:
             raise UpstreamError(
                 f"upstream {r.status_code}: {detail}",
                 retry_after=_parse_retry_after(r),
+                status_code=r.status_code,
             )
         return r.json()
 
@@ -213,6 +233,7 @@ class UpstreamClient:
                 raise UpstreamError(
                     f"upstream {r.status_code}: {detail}",
                     retry_after=_parse_retry_after(r),
+                    status_code=r.status_code,
                 )
             async for chunk in r.aiter_bytes():
                 yield chunk
@@ -238,6 +259,7 @@ class UpstreamClient:
                 raise UpstreamError(
                     f"upstream {r.status_code}: {detail}",
                     retry_after=_parse_retry_after(r),
+                    status_code=r.status_code,
                 )
             state = {"started": False, "rid": None, "item_id": None}
             async for event in _iter_sse_events(r):
@@ -276,9 +298,10 @@ class UpstreamClient:
 class UpstreamError(Exception):
     """上游返回错误。"""
 
-    def __init__(self, message: str, retry_after: int = 0):
+    def __init__(self, message: str, retry_after: int = 0, status_code: int = 0):
         super().__init__(message)
         self.retry_after = retry_after
+        self.status_code = status_code
 
 
 def _parse_retry_after(r) -> int:
@@ -290,6 +313,15 @@ def _parse_retry_after(r) -> int:
         return max(int(val.strip()), 0)
     except (TypeError, ValueError):
         return 0
+
+
+def _classify(status_code: int) -> str:
+    """把 HTTP 状态码归为错误桶：429 / 5xx / 4xx。"""
+    if status_code == 429:
+        return "429"
+    if 500 <= status_code < 600:
+        return "5xx"
+    return "4xx"
 
 
 def _sanitize_responses(payload: dict) -> dict:

@@ -187,6 +187,9 @@ function render(data) {
   pill.className = "pill " + (p.available > 0 ? "ok" : (p.cooldown > 0 ? "warn" : "bad"));
   $("updated").textContent = "更新于 " + now;
 
+  const errs = p.errors || {};
+  const errTotal = Object.values(errs).reduce((a, b) => a + (b || 0), 0);
+
   // KPI
   $("kpiRow").innerHTML =
     kpi("可用代理", p.available, "目标 " + p.target) +
@@ -195,6 +198,10 @@ function render(data) {
     kpi("补池次数", p.refill_count, "死链 " + p.dead_reports) +
     kpi("总请求", fmt(t.requests), "RPM " + (t.requests_per_min ?? "–")) +
     kpi("成功率", fmtPct(100 - (t.error_rate ?? 0)), "错误 " + fmt(t.error)) +
+    kpi("错误构成", fmt(errTotal),
+        "429:" + fmt(errs["429"] || 0) + " 5xx:" + fmt(errs["5xx"] || 0) +
+        " 4xx:" + fmt(errs["4xx"] || 0) + " 超时:" + fmt(errs["timeout"] || 0) +
+        " 连接:" + fmt(errs["conn"] || 0)) +
     kpi("平均延迟", fmtMs(t.avg_latency_ms), "总计 " + fmtMs(0)) +
     kpi("Token 总量", fmt(t.tokens_total), "入 " + fmt(t.tokens_in) + " / 出 " + fmt(t.tokens_out));
 

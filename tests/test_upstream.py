@@ -220,3 +220,46 @@ def test_inject_responses_events_sequence():
     assert names == ["response.created", "response.output_item.added",
                      "data", "data",
                      "response.output_item.done", "data"]
+
+
+def test_classify_status_codes():
+    """状态码归桶：429 / 5xx / 其它 4xx。"""
+    from app.services.upstream import _classify
+
+    assert _classify(429) == "429"
+    assert _classify(500) == "5xx"
+    assert _classify(502) == "5xx"
+    assert _classify(400) == "4xx"
+    assert _classify(404) == "4xx"
+    assert _classify(0) == "4xx"
+
+
+@pytest.mark.asyncio
+async def test_error_buckets_recorded_on_failures():
+    """失败按分类记入错误桶：429/5xx/4xx/timeout/conn。"""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"data: [DONE]\n\n")
+
+    client = make_client(handler, proxies=["1.1.1.1:80", "2.2.2.2:80"])
+    pool = client.pool
+
+    # 直接注入各类失败回写 + 分类桶
+    pool.note_error("429")
+    pool.note_error("5xx")
+    pool.note_error("4xx")
+    pool.note_error("timeout")
+    pool.note_error("conn")
+
+    m = pool.metrics()
+    assert m["errors"] == {"429": 1, "5xx": 1, "4xx": 1, "timeout": 1, "conn": 1}
+
+
+@pytest.mark.asyncio
+async def test_note_error_ignores_unknown_kind():
+    """未知错误桶不报错，只是不计数。"""
+    from app.core.proxy_pool import ProxyPool
+
+    pool = ProxyPool(make_settings())
+    pool.note_error("mystery_kind")
+    m = pool.metrics()
+    assert m["errors"] == {"429": 0, "5xx": 0, "4xx": 0, "timeout": 0, "conn": 0}

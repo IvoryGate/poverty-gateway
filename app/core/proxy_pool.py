@@ -68,6 +68,13 @@ class ProxyPool:
             "cooldown_reports": 0,   # 真实请求 429 回写次数
             "dead_reports": 0,       # 真实请求连接失败回写次数
             "no_proxy_errors": 0,    # 取号失败次数
+            "errors": {              # 错误构成：429 / 5xx / 4xx / timeout / conn
+                "429": 0,
+                "5xx": 0,
+                "4xx": 0,
+                "timeout": 0,
+                "conn": 0,
+            },
         }
         # 探测出的 retry-after（proxy -> 秒），供 _mark_cooldown 精确冷却
         self._probe_retry: dict[str, int] = {}
@@ -150,6 +157,12 @@ class ProxyPool:
         else:
             self._latency[proxy] = 0.3 * float(latency_ms) + 0.7 * old
 
+    def note_error(self, kind: str):
+        """记一次错误分类（429/5xx/4xx/timeout/conn），供面板拆解错误率。"""
+        bucket = self._metrics["errors"]
+        if kind in bucket:
+            bucket[kind] += 1
+
     def metrics(self) -> dict:
         """代理池水位与健康指标（快照）。"""
         in_flight = sum(_as_int(self._store.get(_K_INFLIGHT + p)) for p in self._available)
@@ -168,6 +181,7 @@ class ProxyPool:
             "no_proxy_errors": self._metrics["no_proxy_errors"],
             "latency_median_ms": round(latency_median, 1),
             "latency_sampled": len(self._latency),
+            "errors": dict(self._metrics["errors"]),
         }
 
     # ---------- 池子维护 ----------
