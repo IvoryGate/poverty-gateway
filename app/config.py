@@ -52,8 +52,11 @@ class Settings:
         # 对候选 IP 做 zen 连通性筛选的并发数（探测克制，防自我限流）
         self.probe_concurrency = self._get_int("PROBE_CONCURRENCY", 3)
 
-        # 连通性筛选单 IP 超时（秒）
-        self.probe_timeout = self._get_float("PROBE_TIMEOUT", 15)
+        # 单次补池最多探测的候选数（候选可能上百个，全量探测太慢）
+        self.probe_batch = self._get_int("PROBE_BATCH", 50)
+
+        # 连通性筛选单 IP 超时（秒）：连不上的快速判定 dead，加速补池
+        self.probe_timeout = self._get_float("PROBE_TIMEOUT", 5)
 
         # 探测/冷启动使用的最小 chat 模型（能出对话即视为可用）
         self.probe_model = self._get("PROBE_MODEL", "deepseek-v4-flash-free")

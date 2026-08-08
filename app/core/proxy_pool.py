@@ -180,12 +180,13 @@ class ProxyPool:
         """补池：按档位降级链取候选，并发做最小 chat 探测。
 
         只探测"当前既不在可用池、也不在冷却区"的新 IP，避免重复劳动。
-        探测并发严格限制为 1-2，防止打爆免费额度/自我限流。
+        候选来自 Redis 全量（可能上百个），单次只探测前 probe_batch 个，
+        达到 pool_target 即停，避免全量探测拖垮补池速度。
         """
         self._warm = True
         self._metrics["refill_count"] += 1
         chain = self.settings.quality_chain
-        probe_conc = min(self.settings.probe_concurrency, 2)
+        probe_conc = min(self.settings.probe_concurrency, 6)
         for quality in chain:
             quality = quality.strip()
             raw = await self._fetch_candidates(quality)
@@ -194,7 +195,7 @@ class ProxyPool:
             new_ip = [
                 p for p in raw
                 if p not in self._available and not self._in_cooldown(p)
-            ]
+            ][:self.settings.probe_batch]
             if not new_ip:
                 continue
             good = await self._probe_all(new_ip, probe_conc, quality)
