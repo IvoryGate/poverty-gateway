@@ -192,7 +192,7 @@ function render(data) {
 
   // KPI
   $("kpiRow").innerHTML =
-    kpi("可用代理", p.available, "目标 " + p.target) +
+    kpi("可用代理", p.available, "目标 " + p.target + " (池 " + (p.pool_size ?? p.available) + ")") +
     kpi("冷却中", p.cooldown, "报告 " + p.cooldown_reports) +
     kpi("在途请求", p.in_flight, "上限 " + (p.target * 5)) +
     kpi("补池次数", p.refill_count, "死链 " + p.dead_reports) +

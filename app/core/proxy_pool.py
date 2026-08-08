@@ -167,10 +167,15 @@ class ProxyPool:
         """代理池水位与健康指标（快照）。"""
         in_flight = sum(_as_int(self._store.get(_K_INFLIGHT + p)) for p in self._available)
         cooldown_n = len(self._store.keys(_K_COOLDOWN + "*"))
+        # 真实可用 = 不在冷却中的占位（冷却的不算可用）
+        usable = sum(
+            1 for p in self._available
+            if not self._store.exists(_K_COOLDOWN + p))
         lat = sorted(self._latency.values()) if self._latency else []
         latency_median = lat[len(lat) // 2] if lat else 0.0
         return {
-            "available": len(self._available),
+            "available": usable,
+            "pool_size": len(self._available),
             "in_flight": in_flight,
             "cooldown": cooldown_n,
             "target": self.settings.pool_target,
@@ -187,8 +192,16 @@ class ProxyPool:
     # ---------- 池子维护 ----------
 
     def _low_water(self) -> bool:
-        """可用代理低于低水位时触发补池。"""
-        return len(self._available) < self.settings.pool_low_water
+        """可用代理低于低水位时触发补池。
+
+        只统计"不在冷却中"的 IP——冷却中的占位不算可用，否则冷却的 IP
+        一直占着 _available 的位置导致计数虚高、不补池，真实可用持续缩水
+        （面板 available 看着多，实际能用的一大半在冷却）。
+        """
+        usable = sum(
+            1 for p in self._available
+            if not self._store.exists(_K_COOLDOWN + p))
+        return usable < self.settings.pool_low_water
 
     def save_snapshot(self):
         """把当前可用池快照写入 Redis（优雅停机/定时落盘用）。
