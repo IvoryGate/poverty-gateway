@@ -137,6 +137,14 @@ class RedisStore:
                 self._client = None
         return [k for k in self._memory if pattern.replace("*", "") in k]
 
+    def snapshot_set(self, key: str, ttl: int, value: str):
+        """写入快照（JSON 字符串），带 TTL 过期。"""
+        self.setex(key, ttl, value)
+
+    def snapshot_get(self, key: str) -> str | None:
+        """读取快照 JSON；不存在/已过期返回 None。"""
+        return self.get(key)
+
     # ---------- 熔断 ----------
 
     def circuit_register_failure(self, bucket: str, ttl: int) -> int:

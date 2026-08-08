@@ -30,6 +30,8 @@ DEAD = "dead"             # 连接失败，剔除
 # Redis 键前缀
 _K_INFLIGHT = "inflight:"   # in-flight 计数
 _K_COOLDOWN = "cooldown:"   # 冷却区（值 = "strike:quality"，带 TTL）
+_K_SNAPSHOT = "pool_snapshot"   # 可用池快照（JSON，TTL 24h）
+_SNAPSHOT_TTL = 86400
 
 
 def _as_int(raw) -> int:
@@ -148,6 +150,57 @@ class ProxyPool:
     def _low_water(self) -> bool:
         """可用代理低于低水位时触发补池。"""
         return len(self._available) < self.settings.pool_low_water
+
+    def save_snapshot(self):
+        """把当前可用池快照写入 Redis（优雅停机/定时落盘用）。
+
+        cooldown/in-flight 是带 TTL 的临时状态，随 Redis 天然保存，无需入快照。
+        多 worker 各自持有独立池，保存时与 Redis 已有快照取"更大者"，
+        避免池空/池小的 worker 覆盖掉池大的 worker 写的好快照。
+        """
+        if not self._available:
+            print("snapshot: skip (empty pool)", flush=True)
+            return
+        import json
+        if len(self._available) < self._existing_snapshot_size():
+            print("snapshot: skip (existing bigger)", flush=True)
+            return
+        self._store.snapshot_set(
+            _K_SNAPSHOT, _SNAPSHOT_TTL, json.dumps(self._available))
+        print(f"snapshot: saved {len(self._available)} proxies", flush=True)
+
+    def _existing_snapshot_size(self) -> int:
+        raw = self._store.snapshot_get(_K_SNAPSHOT)
+        if not raw:
+            return 0
+        import json
+        try:
+            parsed = json.loads(raw)
+            return len(parsed) if isinstance(parsed, dict) else 0
+        except (ValueError, TypeError):
+            return 0
+
+    def load_snapshot(self):
+        """启动时从 Redis 加载上次可用池，跳过冷启动重探测。
+
+        加载的 IP 若已被限流（cooldown 键还在）会在 get_proxy 过滤掉；
+        Redis 不可用/无快照则从空池开始正常补池。
+        """
+        raw = self._store.snapshot_get(_K_SNAPSHOT)
+        if not raw:
+            print("snapshot: none to load", flush=True)
+            return
+        import json
+        try:
+            parsed = json.loads(raw)
+        except (ValueError, TypeError):
+            return
+        if not isinstance(parsed, dict):
+            return
+        loaded = {str(k): v for k, v in parsed.items()}
+        if loaded:
+            self._available = loaded
+            self._warm = True
 
     def _mark_cooldown(self, proxy: str, quality: str = "",
                        cooldown_seconds: int = 0):

@@ -28,13 +28,31 @@ def create_app(settings: Settings = None):
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        pool.load_snapshot()
+
+        async def periodic_snapshot():
+            """每 24h 落盘一次可用池快照（重启兜底）。"""
+            try:
+                while True:
+                    await asyncio.sleep(86400)
+                    pool.save_snapshot()
+            except asyncio.CancelledError:
+                pass
+
+        snapshot_task = asyncio.create_task(periodic_snapshot())
         task = asyncio.create_task(model_sync.run_forever())
         yield
         task.cancel()
+        snapshot_task.cancel()
         try:
             await task
         except asyncio.CancelledError:
             pass
+        try:
+            await snapshot_task
+        except asyncio.CancelledError:
+            pass
+        pool.save_snapshot()
 
     app = FastAPI(title="poverty-gateway", version="0.1.0", lifespan=lifespan)
     app.state.settings = settings
