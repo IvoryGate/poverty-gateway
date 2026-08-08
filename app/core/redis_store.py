@@ -94,7 +94,7 @@ class RedisStore:
                 return
             except redis.RedisError:
                 self._client = None
-        self._memory[key] = 1
+        self._memory[key] = value
         self._mem_ts[key] = time.time() + ttl
 
     def setex_once(self, key: str, ttl: int, value: str = "1") -> bool:

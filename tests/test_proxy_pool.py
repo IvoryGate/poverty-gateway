@@ -301,3 +301,31 @@ async def test_cooldown_expiry_allows_reuse():
     pool._store.delete("cooldown:" + proxy)
     got = await pool.get_proxy()
     assert got == proxy
+
+
+@pytest.mark.asyncio
+async def test_zen_score_skips_known_bad():
+    """对 zen 历史表现差的候选，补池时排到后面（好 IP 优先探测）。"""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        proxies = ["1.1.1.1:80", "2.2.2.2:80"]
+        return httpx.Response(200, json={"code": 200, "data": proxies})
+
+    async def probe_fn(proxy: str) -> str:
+        return OK
+
+    transport = httpx.MockTransport(handler)
+    client = httpx.AsyncClient(transport=transport)
+    pool = ProxyPool(
+        make_settings(pool_target=2, quality_chain="stable3"),
+        client=client, probe_fn=probe_fn,
+    )
+    # 给 1.1.1.1:80 灌入低于阈值的 score：补池排序时它排最后
+    for _ in range(5):
+        pool._bump_zen_score("1.1.1.1:80", -1)
+    assert pool._zen_score("1.1.1.1:80") < 0  # 已被标记差
+
+    await pool.get_proxy()
+    # 两个候选最终都会入池（排序只影响探测顺序，不硬跳过）
+    assert "2.2.2.2:80" in pool._available
+    assert "1.1.1.1:80" in pool._available

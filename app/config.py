@@ -49,8 +49,9 @@ class Settings:
         # 单次从 proxy-pool 批量取的候选数（proxy-pool 实测最多稳定给 ~14 个）
         self.batch_size = self._get_int("BATCH_SIZE", 14)
 
-        # 对候选 IP 做 zen 连通性筛选的并发数（探测克制，防自我限流）
-        self.probe_concurrency = self._get_int("PROBE_CONCURRENCY", 3)
+        # 对候选 IP 做 zen 连通性筛选的并发数（探测克制，防自我限流。
+        # 3 太低——几百个候选分批串行探测很慢，补池筛不完；8 兼顾并发与克制）
+        self.probe_concurrency = self._get_int("PROBE_CONCURRENCY", 8)
 
         # 单次补池最多探测的候选数（候选可能上百个，全量探测太慢）
         self.probe_batch = self._get_int("PROBE_BATCH", 60)

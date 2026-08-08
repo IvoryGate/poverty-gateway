@@ -148,6 +148,7 @@ class ProxyPool:
                     self._update_latency(proxy, latency_ms)
                 if proxy not in self._available:
                     self._available[proxy] = {"quality": ""}
+                self._bump_zen_score(proxy, +1)
             elif status == COOLDOWN:
                 self._metrics["cooldown_reports"] += 1
                 self._mark_cooldown(proxy, cooldown_seconds=cooldown_seconds)
@@ -155,6 +156,7 @@ class ProxyPool:
                 self._metrics["dead_reports"] += 1
                 self._available.pop(proxy, None)
                 self._store.delete(_K_COOLDOWN + proxy)
+                self._bump_zen_score(proxy, -1)
 
     def _update_latency(self, proxy: str, latency_ms: float):
         """EWMA 更新某 IP 的延迟估计，平滑抖动（α=0.3 偏重近期）。"""
@@ -289,6 +291,30 @@ class ProxyPool:
     def _in_cooldown(self, proxy: str) -> bool:
         return self._store.exists(_K_COOLDOWN + proxy)
 
+    _K_ZEN_SCORE = "zenhit:"   # 候选 IP 对 zen 的历史表现计数（score）
+    _ZEN_BAD = -3              # score 低于此视为"对 zen 长期不可用"，补池跳过
+
+    def _bump_zen_score(self, proxy: str, delta: int):
+        """记忆候选 IP 对 zen 的历史表现：成功 +1 / 失败 -1。
+
+        补池据此排序：历史表现好的优先探测；连续失败多次的直接跳过，
+        避免反复探测对 zen 无用的死代理（它们通用存活但对 zen 连不上/超时）。
+        score 带 TTL（默认 6h），过期重置，给"死代理复活"留机会。
+        """
+        key = self._K_ZEN_SCORE + proxy
+        cur = 0
+        try:
+            cur = int(self._store.get(key) or 0)
+        except (TypeError, ValueError):
+            cur = 0
+        self._store.setex(key, 6 * 3600, str(cur + delta))
+
+    def _zen_score(self, proxy: str) -> int:
+        try:
+            return int(self._store.get(self._K_ZEN_SCORE + proxy) or 0)
+        except (TypeError, ValueError):
+            return 0
+
     def _schedule_refill(self):
         """低水位时触发后台补池（非阻塞，防 get_proxy 长时间持锁）。
 
@@ -321,18 +347,22 @@ class ProxyPool:
         self._warm = True
         self._metrics["refill_count"] += 1
         chain = self.settings.quality_chain
-        probe_conc = min(self.settings.probe_concurrency, 6)
+        probe_conc = min(self.settings.probe_concurrency, 10)
         batch = max(self.settings.probe_batch, 20)
         for quality in chain:
             quality = quality.strip()
             raw = await self._fetch_candidates(quality)
             if not raw:
                 continue
-            # 过滤出需探测的新 IP，分批循环直到达标或耗尽
+            # 过滤出需探测的新 IP：不在可用池、不在冷却区。
+            # 按历史 score 降序排序：表现好的优先探测；表现差的排最后
+            # （仅降低优先级，不硬性跳过——避免候选被过度排除导致无米下锅，
+            # 6h TTL 也会让失败的 IP 有机会按配额周期复活）。
             pending = [
                 p for p in raw
                 if p not in self._available and not self._in_cooldown(p)
             ]
+            pending.sort(key=self._zen_score, reverse=True)
             pos = 0
             while pos < len(pending):
                 chunk = pending[pos:pos + batch]
@@ -412,12 +442,16 @@ class ProxyPool:
             async with sem:
                 status = await self._probe_fn(proxy)
                 if status == OK:
+                    self._bump_zen_score(proxy, +1)
                     return proxy
                 if status == COOLDOWN:
                     # 探测 429：用上游 retry-after（若有）精确冷却，避免反复探测
                     self._mark_cooldown(
                         proxy, quality,
                         cooldown_seconds=self._probe_retry.get(proxy, 0))
+                else:
+                    # DEAD/超时/连不上：记忆负面表现，下次补池降低优先级
+                    self._bump_zen_score(proxy, -1)
                 return None
 
         results = await asyncio.gather(*(one(p) for p in proxies))
