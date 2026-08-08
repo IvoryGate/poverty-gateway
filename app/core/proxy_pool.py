@@ -177,30 +177,36 @@ class ProxyPool:
         return self._store.exists(_K_COOLDOWN + proxy)
 
     async def _refill(self):
-        """补池：按档位降级链取候选，并发做最小 chat 探测。
+        """补池：按档位降级链取候选，分批探测直到达到 pool_target。
 
         只探测"当前既不在可用池、也不在冷却区"的新 IP，避免重复劳动。
-        候选来自 Redis 全量（可能上百个），单次只探测前 probe_batch 个，
-        达到 pool_target 即停，避免全量探测拖垮补池速度。
+        候选来自 Redis 全量（可能上百个），按 probe_batch 分片循环探测，
+        未达 target 则继续下一批，直到候选耗尽或达标。
         """
         self._warm = True
         self._metrics["refill_count"] += 1
         chain = self.settings.quality_chain
         probe_conc = min(self.settings.probe_concurrency, 6)
+        batch = max(self.settings.probe_batch, 20)
         for quality in chain:
             quality = quality.strip()
             raw = await self._fetch_candidates(quality)
             if not raw:
                 continue
-            new_ip = [
+            # 过滤出需探测的新 IP，分批循环直到达标或耗尽
+            pending = [
                 p for p in raw
                 if p not in self._available and not self._in_cooldown(p)
-            ][:self.settings.probe_batch]
-            if not new_ip:
-                continue
-            good = await self._probe_all(new_ip, probe_conc, quality)
-            for p in good:
-                self._available[p] = {"quality": quality}
+            ]
+            pos = 0
+            while pos < len(pending):
+                chunk = pending[pos:pos + batch]
+                pos += batch
+                good = await self._probe_all(chunk, probe_conc, quality)
+                for p in good:
+                    self._available[p] = {"quality": quality}
+                if len(self._available) >= self.settings.pool_target:
+                    break
             if len(self._available) >= self.settings.pool_target:
                 break
 

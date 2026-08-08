@@ -61,11 +61,12 @@ class Settings:
         # 探测/冷启动使用的最小 chat 模型（能出对话即视为可用）
         self.probe_model = self._get("PROBE_MODEL", "deepseek-v4-flash-free")
 
-        # 可用池低水位：低于此数触发补池（候选源持续增长，需更大池支撑多 key）
-        self.pool_low_water = self._get_int("POOL_LOW_WATER", 12)
+        # 可用池目标规模：补池到此数即停（候选源持续增长，多 key 需更大池）
+        self.pool_target = self._get_int("POOL_TARGET", 60)
 
-        # 可用池目标规模：补池到此数即停（实测候选源可提供 28+ 个可用）
-        self.pool_target = self._get_int("POOL_TARGET", 25)
+        # 可用池低水位：低于 target 的 2/3 触发补池（默认），可用环境变量覆盖
+        self.pool_low_water = self._get_int(
+            "POOL_LOW_WATER", int(self.pool_target * 2 / 3))
 
         # 单个 IP 最大在途并发：超过则取号时跳过，避免同 IP 被打爆
         self.max_in_flight = self._get_int("MAX_IN_FLIGHT", 5)
