@@ -99,9 +99,11 @@ class UpstreamClient:
         excluded: set[str] = set()
         for attempt in range(MAX_RETRIES):
             proxy = await self.pool.get_proxy(exclude=excluded)
+            t0 = time.monotonic()
             try:
                 result = await self._request(endpoint, proxy, payload)
-                await self.pool.report(proxy, OK)
+                elapsed_ms = round((time.monotonic() - t0) * 1000, 1)
+                await self.pool.report(proxy, OK, latency_ms=elapsed_ms)
                 if isinstance(result, dict) and "model" in result:
                     result["model"] = public_model
                 return result
@@ -139,6 +141,7 @@ class UpstreamClient:
         for attempt in range(MAX_RETRIES):
             proxy = await self.pool.get_proxy(exclude=excluded)
             started = False
+            t0 = time.monotonic()
             try:
                 if endpoint == "responses":
                     gen = self._responses_stream_request(proxy, payload)
@@ -146,9 +149,14 @@ class UpstreamClient:
                     gen = self._stream_request(endpoint, proxy, payload)
                 gen = _rewrite_model_bytes(gen, upstream_model, public_model)
                 async for chunk in gen:
-                    started = True
+                    if not started:
+                        started = True
+                        # 首字节延迟 = 上游响应快慢的核心信号，记入延迟表
+                        ttfb = round((time.monotonic() - t0) * 1000, 1)
+                        await self.pool.report(proxy, OK, latency_ms=ttfb)
                     yield chunk
-                await self.pool.report(proxy, OK)
+                if not started:
+                    await self.pool.report(proxy, OK)
                 return
             except UpstreamError as e:
                 last_err = e

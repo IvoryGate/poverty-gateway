@@ -59,6 +59,8 @@ class ProxyPool:
         # 状态机（_available 进程内；in-flight/冷却走 store）
         self._available: dict[str, dict] = {}   # proxy -> {"quality": str}
         self._warm = False                      # 是否已做过首次补池
+        # 延迟表：proxy -> EWMA 耗时(ms)，真实请求/探测回写，取号按此排序
+        self._latency: dict[str, float] = {}    # proxy -> 最近平均耗时 ms
 
         # 观测指标
         self._metrics = {
@@ -100,7 +102,13 @@ class ProxyPool:
             if not candidates:
                 self._metrics["no_proxy_errors"] += 1
                 raise NoProxyAvailable("代理池无可用代理（全部被排除）")
-            pick = min(candidates, key=lambda p: _as_int(self._store.get(_K_INFLIGHT + p)))
+            pick = min(
+                candidates,
+                key=lambda p: (
+                    _as_int(self._store.get(_K_INFLIGHT + p)),   # 优先最空闲
+                    self._latency.get(p, 0.0),                    # 同空闲取延迟低
+                ),
+            )
             # TTL 兜底：任何泄漏（异常/未归还）的计数 10 分钟后自动清除
             self._store.incr(_K_INFLIGHT + pick, ttl=600)
             return pick
@@ -109,16 +117,21 @@ class ProxyPool:
         """请求结束（无论成败）归还 in-flight 计数。"""
         self._store.decr(_K_INFLIGHT + proxy)
 
-    async def report(self, proxy: str, status: str, cooldown_seconds: int = 0):
+    async def report(self, proxy: str, status: str, cooldown_seconds: int = 0,
+                     latency_ms: float = 0.0):
         """真实请求结果回写池状态（隐式探测，不额外消耗上游）。
 
         cooldown_seconds: 429 时上游返回的解封秒数（retry-after），
         有则用它精确设定冷却时长，到期第一时间复活。
+        latency_ms: 本次请求总耗时（ms），成功时并入 EWMA 延迟表，
+        取号按此排序优先选快 IP。
         """
         async with self._lock:
             self._store.decr(_K_INFLIGHT + proxy)
             if status == OK:
                 self._store.delete(_K_COOLDOWN + proxy)
+                if latency_ms > 0:
+                    self._update_latency(proxy, latency_ms)
                 if proxy not in self._available:
                     self._available[proxy] = {"quality": ""}
             elif status == COOLDOWN:
@@ -129,10 +142,20 @@ class ProxyPool:
                 self._available.pop(proxy, None)
                 self._store.delete(_K_COOLDOWN + proxy)
 
+    def _update_latency(self, proxy: str, latency_ms: float):
+        """EWMA 更新某 IP 的延迟估计，平滑抖动（α=0.3 偏重近期）。"""
+        old = self._latency.get(proxy)
+        if old is None:
+            self._latency[proxy] = float(latency_ms)
+        else:
+            self._latency[proxy] = 0.3 * float(latency_ms) + 0.7 * old
+
     def metrics(self) -> dict:
         """代理池水位与健康指标（快照）。"""
         in_flight = sum(_as_int(self._store.get(_K_INFLIGHT + p)) for p in self._available)
         cooldown_n = len(self._store.keys(_K_COOLDOWN + "*"))
+        lat = sorted(self._latency.values()) if self._latency else []
+        latency_median = lat[len(lat) // 2] if lat else 0.0
         return {
             "available": len(self._available),
             "in_flight": in_flight,
@@ -143,6 +166,8 @@ class ProxyPool:
             "cooldown_reports": self._metrics["cooldown_reports"],
             "dead_reports": self._metrics["dead_reports"],
             "no_proxy_errors": self._metrics["no_proxy_errors"],
+            "latency_median_ms": round(latency_median, 1),
+            "latency_sampled": len(self._latency),
         }
 
     # ---------- 池子维护 ----------
@@ -345,8 +370,11 @@ class ProxyPool:
         探测请求用最小 token 的 chat（max_tokens=1），只求拿到 200。
         429 → 限流（COOLDOWN），并把 retry-after 记录到 _probe_retry；
         连不上/其他 → DEAD。
+        探测同时记录耗时到 EWMA 延迟表，冷启动时就有延迟排序依据，
+        无需额外请求。
         注：httpx 0.28 代理参数在 client 构造时传，每 IP 独立 client。
         """
+        import time
         url = f"{self.settings.upstream_base}/chat/completions"
         proxy_url = f"http://{proxy}"
         body = {
@@ -354,6 +382,7 @@ class ProxyPool:
             "messages": [{"role": "user", "content": "hi"}],
             "max_tokens": 1,
         }
+        t0 = time.monotonic()
         try:
             async with httpx.AsyncClient(
                 proxy=proxy_url, timeout=self.settings.probe_timeout
@@ -361,7 +390,9 @@ class ProxyPool:
                 r = await client.post(url, headers=zen_headers(), json=body)
         except httpx.HTTPError:
             return DEAD
+        elapsed_ms = round((time.monotonic() - t0) * 1000, 1)
         if r.status_code == 200:
+            self._update_latency(proxy, elapsed_ms)
             return OK
         if r.status_code == 429:
             try:
