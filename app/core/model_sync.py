@@ -17,7 +17,7 @@ import httpx
 
 from app.config import Settings
 from app.core.headers import zen_headers
-from app.core.model_map import ModelMapper
+from app.core.model_map import ModelMapper, to_public
 from app.core.proxy_pool import NoProxyAvailable, ProxyPool
 
 logger = logging.getLogger(__name__)
@@ -31,9 +31,8 @@ class ModelSync:
         self._pool = pool  # 复用主链路 ProxyPool（含共享 store）
 
     async def sync_once(self) -> dict:
-        """执行一次同步，返回 {added: [...], removed: [...]}。"""
-        candidates = await self._fetch_free_models()
-        # 排除配置禁用的
+        """执行一次同步，返回 {added: [...], removed: [...]}（对外名）。"""
+        candidates = await self._fetch_free_models()          # 内部 -free 名
         denied = set(self.settings.model_denylist)
         candidates = [m for m in candidates if m not in denied]
 
@@ -47,26 +46,29 @@ class ModelSync:
                 return None
 
         results = await asyncio.gather(*(check(m) for m in candidates))
-        available = [m for m in results if m]
+        available = [m for m in results if m]                 # 内部 -free 名
 
-        old = self.mapper.models()
-        old_keys = set(old.keys())
-        candidate_set = set(candidates)
-        new_keys = set(available)
+        old = self.mapper.models()                            # {lite: free}
+        old_keys = set(old.keys())                            # lite 集合
+        # 对外名集合：候选与可用都转成 lite
+        cand_pub = {to_public(m) for m in candidates}
+        avail_pub = {to_public(m) for m in available}
 
-        if not new_keys and not candidate_set:
+        if not cand_pub:
             # 候选列表本身为空（拉取失败），保留现状
             return {"added": [], "removed": [], "available": []}
 
         # 增量更新：保留"本次探测通过" + "旧映射里仍在候选但本次临时失败"的
         # （避免一次限流把好模型全摘掉；真正下架的会从候选列表消失）
-        keep = new_keys | (old_keys & candidate_set)
-        merged = {m: old.get(m, m) for m in keep}
+        keep = avail_pub | (old_keys & cand_pub)
+        merged = {p: old.get(p, p.replace("-lite", "-free"))
+                  for p in keep}
         self.mapper.set_models(merged)
 
-        added = sorted(new_keys - old_keys)
-        removed = sorted(old_keys - (old_keys & candidate_set))
-        return {"added": added, "removed": removed, "available": sorted(new_keys)}
+        added = sorted(avail_pub - old_keys)
+        removed = sorted(old_keys - cand_pub)
+        return {"added": added, "removed": removed,
+                "available": sorted(avail_pub)}
 
     def _get_pool(self):
         return self._pool or ProxyPool(self.settings)

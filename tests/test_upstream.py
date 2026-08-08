@@ -73,7 +73,7 @@ async def test_chat_stream_passthrough():
 
     client = make_client(handler)
     chunks = []
-    async for chunk in client.chat_stream("deepseek-v4-flash-free", {"model": "x"}):
+    async for chunk in client.chat_stream("deepseek-v4-flash-lite", {"model": "x"}):
         chunks.append(chunk)
     assert chunks == list(sse)
     assert req_seen["stream"] is not None
@@ -94,7 +94,7 @@ async def test_chat_stream_retry_on_429():
 
     client = make_client(handler, proxies=["1.1.1.1:80", "2.2.2.2:80"])
     chunks = [c async for c in client.chat_stream(
-        "deepseek-v4-flash-free", {"model": "x"})]
+        "deepseek-v4-flash-lite", {"model": "x"})]
     assert calls["n"] == 2
     assert chunks == [b"data: [DONE]\n\n"]
 
@@ -111,7 +111,7 @@ async def test_chat_stream_4xx_no_retry():
     client = make_client(handler)
     with pytest.raises(UpstreamError):
         async for _ in client.chat_stream(
-            "deepseek-v4-flash-free", {"model": "x"}):
+            "deepseek-v4-flash-lite", {"model": "x"}):
             pass
     assert calls["n"] == 1
 
@@ -124,7 +124,7 @@ async def test_chat_stream_report_ok_after_success():
 
     client = make_client(handler)
     async for _ in client.chat_stream(
-            "deepseek-v4-flash-free", {"model": "x"}):
+            "deepseek-v4-flash-lite", {"model": "x"}):
         pass
     assert "1.1.1.1:80" in client.pool._available
 
@@ -142,7 +142,7 @@ async def test_chat_stream_report_dead_on_conn_error():
 
     client = make_client(handler, proxies=["1.1.1.1:80", "2.2.2.2:80"])
     chunks = [c async for c in client.chat_stream(
-        "deepseek-v4-flash-free", {"model": "x"})]
+        "deepseek-v4-flash-lite", {"model": "x"})]
     assert calls["n"] == 2
     assert chunks == [b"data: [DONE]\n\n"]
 
@@ -164,7 +164,7 @@ async def test_circuit_breaker_trips_on_many_failures():
     # 熔断打开：快速失败，不再尝试上游
     with pytest.raises(UpstreamError):
         async for _ in client.chat_stream(
-                "deepseek-v4-flash-free", {"model": "x"}):
+                "deepseek-v4-flash-lite", {"model": "x"}):
             pass
 
 

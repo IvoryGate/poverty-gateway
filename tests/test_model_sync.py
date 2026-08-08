@@ -64,8 +64,8 @@ async def test_sync_discovers_free_models():
     )
     result = await sync.sync_once()
     assert "gpt-5" not in result["available"]  # 非 free 被筛掉
-    assert sync.mapper.has("deepseek-v4-flash-free")
-    assert sync.mapper.has("mimo-v2.5-free")
+    assert sync.mapper.has("deepseek-v4-flash-lite")
+    assert sync.mapper.has("mimo-v2.5-lite")
     assert not sync.mapper.has("gpt-5")
 
 
@@ -78,8 +78,8 @@ async def test_sync_keeps_existing_on_temp_failure():
     )
     # deepseek 是默认映射之一，本次探测失败但仍在候选 → 保留
     await sync.sync_once()
-    assert sync.mapper.has("deepseek-v4-flash-free")
-    assert sync.mapper.has("new-model-free")
+    assert sync.mapper.has("deepseek-v4-flash-lite")
+    assert sync.mapper.has("new-model-lite")
 
 
 @pytest.mark.asyncio
@@ -90,7 +90,7 @@ async def test_sync_removes_models_no_longer_in_candidates():
         probe_results={"old-free": True, "good-free": True},
     )
     await sync.sync_once()
-    assert sync.mapper.has("old-free")
+    assert sync.mapper.has("old-lite")
     # 二次同步：old-free 从候选消失 → 摘除
     async def fetch_second() -> list[str]:
         return ["good-free"]
@@ -99,9 +99,9 @@ async def test_sync_removes_models_no_longer_in_candidates():
         return True
     sync._probe_model = probe2  # type: ignore[method-assign]
     result = await sync.sync_once()
-    assert result["removed"] == ["old-free"]
-    assert sync.mapper.has("good-free")
-    assert not sync.mapper.has("old-free")
+    assert result["removed"] == ["old-lite"]
+    assert sync.mapper.has("good-lite")
+    assert not sync.mapper.has("old-lite")
 
 
 @pytest.mark.asyncio
@@ -113,8 +113,8 @@ async def test_sync_respects_denylist():
         denylist=["bad-free"],
     )
     await sync.sync_once()
-    assert sync.mapper.has("good-free")
-    assert not sync.mapper.has("bad-free")
+    assert sync.mapper.has("good-lite")
+    assert not sync.mapper.has("bad-lite")
 
 
 @pytest.mark.asyncio
@@ -125,13 +125,13 @@ async def test_sync_reports_added_removed():
         probe_results={"a-free": True, "b-free": True},
     )
     result = await sync.sync_once()
-    assert result["added"] == ["a-free", "b-free"]
+    assert result["added"] == ["a-lite", "b-lite"]
 
     # 二次同步 b 下架：应报告 removed=["b-free"]
     async def fetch_second() -> list[str]:
         return ["a-free"]
     sync._fetch_free_models = fetch_second  # type: ignore[method-assign]
     result2 = await sync.sync_once()
-    assert result2["removed"] == ["b-free"]
-    assert sync.mapper.has("a-free")
-    assert not sync.mapper.has("b-free")
+    assert result2["removed"] == ["b-lite"]
+    assert sync.mapper.has("a-lite")
+    assert not sync.mapper.has("b-lite")

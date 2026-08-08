@@ -78,7 +78,7 @@ async def test_extra_fields_passthrough():
         seen["payload"] = json.loads(request.content)
         return httpx.Response(200, json={
             "id": "x", "object": "chat.completion", "created": 0,
-            "model": "deepseek-v4-flash-free",
+            "model": "deepseek-v4-flash-lite",
             "choices": [{"index": 0, "finish_reason": "stop",
                          "message": {"role": "assistant", "content": "ok"}}],
         })
@@ -88,7 +88,7 @@ async def test_extra_fields_passthrough():
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
         r = await ac.post("/v1/chat/completions",
                           headers={"Authorization": "Bearer sk-alice"}, json={
-            "model": "deepseek-v4-flash-free",
+            "model": "deepseek-v4-flash-lite",
             "messages": [{"role": "user", "content": "hi"}],
             "reasoning_effort": "low",
             "tools": [{"type": "function", "function": {"name": "x"}}],
@@ -146,7 +146,7 @@ async def test_auth_required():
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
         r = await ac.post("/v1/chat/completions", json={
-            "model": "deepseek-v4-flash-free",
+            "model": "deepseek-v4-flash-lite",
             "messages": [{"role": "user", "content": "hi"}]})
     assert r.status_code == 401
 
@@ -157,7 +157,7 @@ async def test_auth_valid_key_passes():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={
             "id": "x", "object": "chat.completion", "created": 0,
-            "model": "deepseek-v4-flash-free",
+            "model": "deepseek-v4-flash-lite",
             "choices": [{"index": 0, "finish_reason": "stop",
                          "message": {"role": "assistant", "content": "ok"}}],
         })
@@ -168,7 +168,7 @@ async def test_auth_valid_key_passes():
         r = await ac.post(
             "/v1/chat/completions",
             headers={"Authorization": "Bearer sk-alice"},
-            json={"model": "deepseek-v4-flash-free",
+            json={"model": "deepseek-v4-flash-lite",
                   "messages": [{"role": "user", "content": "hi"}]})
     assert r.status_code == 200
 
@@ -179,7 +179,7 @@ async def test_rate_limit_429():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={
             "id": "x", "object": "chat.completion", "created": 0,
-            "model": "deepseek-v4-flash-free",
+            "model": "deepseek-v4-flash-lite",
             "choices": [{"index": 0, "finish_reason": "stop",
                          "message": {"role": "assistant", "content": "ok"}}],
         })
@@ -191,12 +191,12 @@ async def test_rate_limit_429():
             r = await ac.post(
                 "/v1/chat/completions",
                 headers={"Authorization": "Bearer sk-alice"},
-                json={"model": "deepseek-v4-flash-free",
+                json={"model": "deepseek-v4-flash-lite",
                       "messages": [{"role": "user", "content": "hi"}]})
         r = await ac.post(
             "/v1/chat/completions",
             headers={"Authorization": "Bearer sk-alice"},
-            json={"model": "deepseek-v4-flash-free",
+            json={"model": "deepseek-v4-flash-lite",
                   "messages": [{"role": "user", "content": "hi"}]})
     assert r.status_code == 429
 
@@ -207,7 +207,7 @@ async def test_no_version_endpoint_alias():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={
             "id": "x", "object": "chat.completion", "created": 0,
-            "model": "deepseek-v4-flash-free",
+            "model": "deepseek-v4-flash-lite",
             "choices": [{"index": 0, "finish_reason": "stop",
                          "message": {"role": "assistant", "content": "ok"}}],
         })
@@ -218,7 +218,7 @@ async def test_no_version_endpoint_alias():
         r1 = await ac.post(
             "/chat/completions",
             headers={"Authorization": "Bearer sk-alice"},
-            json={"model": "deepseek-v4-flash-free",
+            json={"model": "deepseek-v4-flash-lite",
                   "messages": [{"role": "user", "content": "hi"}]})
         r2 = await ac.get("/models",
                           headers={"Authorization": "Bearer sk-alice"})
@@ -237,7 +237,7 @@ async def test_responses_endpoint_passthrough():
         seen["payload"] = json.loads(request.content)
         return httpx.Response(200, json={
             "id": "resp_1", "object": "response", "created_at": 0,
-            "model": "deepseek-v4-flash-free",
+            "model": "deepseek-v4-flash-lite",
             "output": [{"type": "message",
                         "content": [{"type": "output_text", "text": "ok"}]}],
         })
@@ -248,7 +248,7 @@ async def test_responses_endpoint_passthrough():
         r = await ac.post(
             "/v1/responses",
             headers={"Authorization": "Bearer sk-alice"},
-            json={"model": "deepseek-v4-flash-free",
+            json={"model": "deepseek-v4-flash-lite",
                   "input": [{"role": "user",
                              "content": [{"type": "input_text", "text": "hi"}]}]})
     assert r.status_code == 200
@@ -263,7 +263,7 @@ async def test_stats_tracks_usage():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={
             "id": "x", "object": "chat.completion", "created": 0,
-            "model": "deepseek-v4-flash-free",
+            "model": "deepseek-v4-flash-lite",
             "choices": [{"index": 0, "finish_reason": "stop",
                          "message": {"role": "assistant", "content": "ok"}}],
             "usage": {"prompt_tokens": 10, "completion_tokens": 5,
@@ -276,7 +276,7 @@ async def test_stats_tracks_usage():
         await ac.post(
             "/v1/chat/completions",
             headers={"Authorization": "Bearer sk-alice"},
-            json={"model": "deepseek-v4-flash-free",
+            json={"model": "deepseek-v4-flash-lite",
                   "messages": [{"role": "user", "content": "hi"}]})
         r = await ac.get("/v1/stats",
                          headers={"Authorization": "Bearer sk-alice"})
