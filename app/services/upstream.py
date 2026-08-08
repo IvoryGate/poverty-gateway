@@ -102,6 +102,8 @@ class UpstreamClient:
             try:
                 result = await self._request(endpoint, proxy, payload)
                 await self.pool.report(proxy, OK)
+                if isinstance(result, dict) and "model" in result:
+                    result["model"] = public_model
                 return result
             except UpstreamError as e:
                 last_err = e
@@ -142,6 +144,7 @@ class UpstreamClient:
                     gen = self._responses_stream_request(proxy, payload)
                 else:
                     gen = self._stream_request(endpoint, proxy, payload)
+                gen = _rewrite_model_bytes(gen, upstream_model, public_model)
                 async for chunk in gen:
                     started = True
                     yield chunk
@@ -382,3 +385,21 @@ def _sse_event_bytes(name: str, obj: dict) -> bytes:
     if name == "data":
         return f"data: {body}\n\n".encode()
     return f"event: {name}\ndata: {body}\n\n".encode()
+
+
+async def _rewrite_model_bytes(gen, upstream_model: str, public_model: str):
+    """逐 SSE 帧把 model 字段从上游名改写成对外名，流式返回。
+
+    SSE 帧以 \\n\\n 分隔，缓冲到完整帧再替换，保证 model 名不被截断。
+    不缓存整个响应，仅逐帧处理，对吞吐影响可忽略。
+    """
+    up = upstream_model.encode()
+    pub = public_model.encode()
+    buf = b""
+    async for frame in gen:
+        buf += frame
+        while b"\n\n" in buf:
+            chunk, buf = buf.split(b"\n\n", 1)
+            yield chunk.replace(up, pub) + b"\n\n"
+    if buf:
+        yield buf.replace(up, pub)
