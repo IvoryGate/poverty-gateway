@@ -202,8 +202,9 @@ class UpstreamClient:
     async def _request(self, endpoint: str, proxy: str, payload: dict) -> dict:
         url = f"{self.settings.upstream_base}/{endpoint}"
         proxy_url = f"http://{proxy}"
+        timeout = httpx.Timeout(connect=15, read=300, write=30, pool=15)
         async with httpx.AsyncClient(
-            timeout=120, proxy=proxy_url
+            timeout=timeout, proxy=proxy_url
         ) as client:
             r = await client.post(
                 url, headers=zen_headers(), json=payload

@@ -19,6 +19,15 @@ DEFAULT_MODEL_MAP = {
     "longcat-2.0-lite": "longcat-2.0-free",
 }
 
+# 对外模型 → 上下文/输出限制（tokens）。实测+上游真值：free 变体底层模型
+# 均支持 1M 上下文（opencode 内置 base 模型元数据验证），此处如实上报，
+# 供读取 /v1/models context_length 的客户端（Cursor/Codex 等）正确配置。
+DEFAULT_MODEL_LIMITS = {
+    "deepseek-v4-flash-lite": {"context": 1048576, "output": 128000},
+    "mimo-v2.5-lite": {"context": 1048576, "output": 131072},
+    "longcat-2.0-lite": {"context": 1048576, "output": 262144},
+}
+
 # Redis 键：当前模型映射（JSON）
 _K_MODELS = "models:map"
 
@@ -35,6 +44,7 @@ class ModelMapper:
         self.settings = settings or Settings()
         self._store = store or RedisStore(settings)
         self._local = dict(DEFAULT_MODEL_MAP)
+        self._limits = dict(DEFAULT_MODEL_LIMITS)
 
     def to_upstream(self, public_name: str) -> str:
         """对外模型名 → 内部真实模型名。未知名抛 KeyError。"""
@@ -44,17 +54,29 @@ class ModelMapper:
         return m[public_name]
 
     def list_public(self) -> list[dict]:
-        """对外模型列表（动态）。"""
-        return [{"id": name, "object": "model"} for name in self.models()]
+        """对外模型列表（动态），带 context_length 供客户端正确配置上下文。"""
+        return [
+            {"id": name, "object": "model",
+             "context_length": self._limits.get(name, {}).get("context", 0),
+             "output_tokens": self._limits.get(name, {}).get("output", 0)}
+            for name in self.models()
+        ]
 
     def has(self, public_name: str) -> bool:
         return public_name in self.models()
 
     def set_models(self, models: dict[str, str]):
-        """整体替换对外模型映射（ModelSync 调用），并落 Redis 共享。"""
+        """整体替换对外模型映射（ModelSync 调用），并落 Redis 共享。
+
+        limits 保留已知模型的上下文/输出值；新模型用默认 1M 上下文。
+        """
         self._local = dict(models)
         if self._store.using_redis:
             self._store.setex(_K_MODELS, 3600, json.dumps(models))
+
+    def limits(self, public_name: str) -> dict:
+        """某对外模型的 (context, output) 限制（未知模型给默认 1M/128k）。"""
+        return self._limits.get(public_name, {"context": 1048576, "output": 128000})
 
     def models(self) -> dict[str, str]:
         """当前完整映射快照（Redis 有则读 Redis，保证多 worker 一致）。"""
