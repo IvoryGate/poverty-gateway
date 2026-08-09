@@ -26,6 +26,7 @@
 import argparse
 import asyncio
 import json
+import os
 import random
 import time
 
@@ -214,7 +215,7 @@ def main():
     ap = argparse.ArgumentParser(description="大海捞针上下文压测（加强版）")
     ap.add_argument("--model", default="deepseek-v4-flash-lite")
     ap.add_argument("--base-url", default="https://api.pixelreeds.com")
-    ap.add_argument("--key", default="sk-REDACTED")
+    ap.add_argument("--key", default=os.environ.get("OPENCODE_KEY", ""))
     ap.add_argument("--sizes", default="128000,512000,1000000")
     ap.add_argument("--positions", default="head,mid,tail")
     ap.add_argument("--trials", type=int, default=3)
