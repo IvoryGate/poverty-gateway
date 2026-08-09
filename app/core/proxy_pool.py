@@ -101,21 +101,28 @@ class ProxyPool:
             if not self._available:
                 self._metrics["no_proxy_errors"] += 1
                 raise NoProxyAvailable("代理池无可用代理")
-            candidates = [
+            base_candidates = [
                 p for p in self._available
                 if p not in exclude
                 and _as_int(self._store.get(_K_INFLIGHT + p)) < self.settings.max_in_flight
                 and not self._store.exists(_K_COOLDOWN + p)
             ]
-            if not candidates:
+            if not base_candidates:
                 # 全部在途满/冷却/被排除：取最空闲且未冷却的兜底（宁缺毋滥，不选冷却 IP）
-                candidates = [
+                base_candidates = [
                     p for p in self._available
                     if p not in exclude and not self._store.exists(_K_COOLDOWN + p)
                 ]
-            if not candidates:
+            if not base_candidates:
                 self._metrics["no_proxy_errors"] += 1
                 raise NoProxyAvailable("代理池无可用代理（全部被排除）")
+            # 按 zen 命中历史分档：正分（对 zen 成功过）优先，负分兜底。
+            # 冷却恢复的 IP 多数仍连不上 zen，不能让它们和好 IP 同权重竞争。
+            positive = [p for p in base_candidates if self._zen_score(p) > 0]
+            if positive:
+                candidates = positive
+            else:
+                candidates = base_candidates
             pick = min(
                 candidates,
                 key=lambda p: (
