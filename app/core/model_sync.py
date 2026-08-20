@@ -82,7 +82,7 @@ class ModelSync:
             pool_proxy = await pool.get_proxy()
         except NoProxyAvailable:
             return []
-        url = f"{self.settings.upstream_base}/models"
+        url = f"{self.settings.upstream_endpoint}/models"
         try:
             async with httpx.AsyncClient(
                 proxy=f"http://{pool_proxy}", timeout=15
@@ -106,7 +106,7 @@ class ModelSync:
             proxy = await pool.get_proxy()
         except NoProxyAvailable:
             return False
-        url = f"{self.settings.upstream_base}/chat/completions"
+        url = f"{self.settings.upstream_endpoint}/chat/completions"
         body = {
             "model": model,
             "messages": [{"role": "user", "content": "hi"}],

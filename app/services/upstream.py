@@ -204,7 +204,7 @@ class UpstreamClient:
         raise last_err or UpstreamError("no proxy retries left")
 
     async def _request(self, endpoint: str, proxy: str, payload: dict) -> dict:
-        url = f"{self.settings.upstream_base}/{endpoint}"
+        url = f"{self.settings.upstream_endpoint}/{endpoint}"
         proxy_url = f"http://{proxy}"
         timeout = httpx.Timeout(connect=15, read=300, write=30, pool=15)
         async with httpx.AsyncClient(
@@ -225,7 +225,7 @@ class UpstreamClient:
 
     async def _stream_request(self, endpoint: str, proxy: str, payload: dict):
         """对单个代理发起流式 POST，产出上游原始字节块。"""
-        url = f"{self.settings.upstream_base}/{endpoint}"
+        url = f"{self.settings.upstream_endpoint}/{endpoint}"
         proxy_url = f"http://{proxy}"
         timeout = httpx.Timeout(connect=15, read=300, write=30, pool=15)
         async with httpx.AsyncClient(
@@ -252,7 +252,7 @@ class UpstreamClient:
         output_item.added / output_item.done 才能组装输出。这里解析 SSE 流，
         在合适位置注入缺失事件。
         """
-        url = f"{self.settings.upstream_base}/responses"
+        url = f"{self.settings.upstream_endpoint}/responses"
         proxy_url = f"http://{proxy}"
         timeout = httpx.Timeout(connect=15, read=300, write=30, pool=15)
         async with httpx.AsyncClient(
@@ -297,7 +297,7 @@ class UpstreamClient:
             async with httpx.AsyncClient(
                 timeout=15, proxy=proxy_url
             ) as client:
-                r = await client.get(f"{self.settings.upstream_base}/models")
+                r = await client.get(f"{self.settings.upstream_endpoint}/models")
                 return r.status_code in (200, 401, 403)
         except httpx.HTTPError:
             return False

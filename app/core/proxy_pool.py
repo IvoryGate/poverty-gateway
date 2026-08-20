@@ -16,6 +16,7 @@
 
 import asyncio
 import logging
+import time
 
 import httpx
 
@@ -66,6 +67,8 @@ class ProxyPool:
         self._warm = False                      # 是否已做过首次补池
         # 延迟表：proxy -> EWMA 耗时(ms)，真实请求/探测回写，取号按此排序
         self._latency: dict[str, float] = {}    # proxy -> 最近平均耗时 ms
+        # 最近一次被选中/真实请求命中的时间戳（stale spot-check 用）
+        self._last_used: dict[str, float] = {}  # proxy -> epoch 秒
 
         # 观测指标
         self._metrics = {
@@ -116,6 +119,15 @@ class ProxyPool:
             if not base_candidates:
                 self._metrics["no_proxy_errors"] += 1
                 raise NoProxyAvailable("代理池无可用代理（全部被排除）")
+            # 延迟硬上限过滤：已知延迟超过 max_latency_ms 的直接剔除（宁缺毋滥）。
+            # 之前只按延迟排序"慢的排后面"，但慢/挂代理仍会被选中拖垮请求；
+            # 现在有超过上限的就直接不选，逼补池换上更快的新 IP。
+            fast = [
+                p for p in base_candidates
+                if self._latency.get(p, 0) <= self.settings.max_latency_ms
+            ]
+            if fast:
+                base_candidates = fast
             # 按 zen 命中历史分档：正分（对 zen 成功过）优先，负分兜底。
             # 冷却恢复 / 快照回灌的僵尸大多连不上 zen，不能让它们和好 IP 同权重。
             positive = [p for p in base_candidates if self._zen_score(p) > 0]
@@ -132,6 +144,7 @@ class ProxyPool:
             )
             # TTL 兜底：任何泄漏（异常/未归还）的计数 10 分钟后自动清除
             self._store.incr(_K_INFLIGHT + pick, ttl=600)
+            self._last_used[pick] = time.time()
             return pick
 
     def release(self, proxy: str):
@@ -155,6 +168,7 @@ class ProxyPool:
                     self._update_latency(proxy, latency_ms)
                 if proxy not in self._available:
                     self._available[proxy] = {"quality": ""}
+                self._last_used[proxy] = time.time()
                 self._bump_zen_score(proxy, +1)
             elif status == COOLDOWN:
                 self._metrics["cooldown_reports"] += 1
@@ -168,15 +182,29 @@ class ProxyPool:
     async def _reverify_pool_members(self, concurrency: int, batch: int):
         """重验池内可疑成员，剔除失效/被限流的僵尸 IP。
 
-        快照加载/冷却恢复容易把"已失效或刚被限流"的 IP 留在 _available，
-        它们在取号里挤占位置却连不上 zen → 全 429。这里只对**非正分**成员
-        （从未验证/历史失败过）做最小 chat 探测：OK 保留、429 进冷却、
-        DEAD 剔除；正分好 IP 不重复探测，避免消耗额度。
+        两类成员会被重验（都是真实 chat 探测，保证通畅）：
+        1. **非正分成员**（从未验证/历史失败过）：可能连不上 zen。
+        2. **闲置太久的好成员**（正分但超过 stale_after_s 未被真实请求/探测
+           命中）：免费代理短命，"验证过"≠"现在还活着"，长时间没人用的
+           可能已经死了，重新验一下保证池子里没有"放久了变僵尸"的占位。
+
+        探测结果：OK 保留、429 进冷却、DEAD 剔除。
+        每轮只抽查 stale_check_batch 个闲置成员，避免一次性烧太多探测额度。
         """
-        members = [
+        now = time.time()
+        # 非正分：全部重验（数量少，占位坏影响大）
+        bad = [
             p for p in self._available
             if not self._in_cooldown(p) and self._zen_score(p) <= 0
         ]
+        # 正分但闲置过久：按"最久没用"优先，最多抽查 stale_check_batch 个
+        stale = [
+            p for p in self._available
+            if not self._in_cooldown(p) and self._zen_score(p) > 0
+            and self._last_used.get(p, 0) < now - self.settings.stale_after_s
+        ]
+        stale.sort(key=lambda p: self._last_used.get(p, 0))
+        members = bad + stale[: self.settings.stale_check_batch]
         if not members:
             return
         sem = asyncio.Semaphore(concurrency)
@@ -188,6 +216,7 @@ class ProxyPool:
                 status = await self._probe_fn(proxy)
                 if status == OK:
                     self._bump_zen_score(proxy, +1)
+                    self._last_used[proxy] = time.time()
                     return None
                 if status == COOLDOWN:
                     self._mark_cooldown(
@@ -401,7 +430,8 @@ class ProxyPool:
         self._warm = True
         self._metrics["refill_count"] += 1
         chain = self.settings.quality_chain
-        probe_conc = min(self.settings.probe_concurrency, 10)
+        # 上游扩量后 12 并发合理：探测克制（防自我限流），又能较快消化候选
+        probe_conc = min(self.settings.probe_concurrency, 20)
         batch = max(self.settings.probe_batch, 20)
         # 先重验池内可疑成员：快照回灌/冷却恢复的僵尸"占位但连不上"，
         # 不剔掉的话 _usable_count 虚高 → 补池停摆、取号专挑僵尸 → 全 429。
@@ -500,6 +530,7 @@ class ProxyPool:
                 status = await self._probe_fn(proxy)
                 if status == OK:
                     self._bump_zen_score(proxy, +1)
+                    self._last_used[proxy] = time.time()
                     return proxy
                 if status == COOLDOWN:
                     # 探测 429：用上游 retry-after（若有）精确冷却，避免反复探测
@@ -525,7 +556,7 @@ class ProxyPool:
         注：httpx 0.28 代理参数在 client 构造时传，每 IP 独立 client。
         """
         import time
-        url = f"{self.settings.upstream_base}/chat/completions"
+        url = f"{self.settings.upstream_endpoint}/chat/completions"
         proxy_url = f"http://{proxy}"
         body = {
             "model": self.settings.probe_model,

@@ -427,3 +427,106 @@ async def test_pick_prefers_positive_score_over_bad():
 
     got = await pool.get_proxy()
     assert got == "2.2.2.2:80"
+
+
+@pytest.mark.asyncio
+async def test_pick_filters_slow_proxies():
+    """已知延迟超过 max_latency_ms 的 IP 不被选中（宁缺毋滥）。"""
+    pool = make_pool(
+        {"stable3": ["1.1.1.1:80", "2.2.2.2:80"], "stable2": [], "stable1": []},
+    )
+    pool._available = {
+        "1.1.1.1:80": {"quality": "stable3"},   # 慢
+        "2.2.2.2:80": {"quality": "stable3"},   # 快
+    }
+    pool._warm = True
+    pool._update_latency("1.1.1.1:80", 30000)  # 30s > max_latency_ms(默认15000)
+    pool._update_latency("2.2.2.2:80", 2000)
+
+    got = await pool.get_proxy()
+    assert got == "2.2.2.2:80"
+
+
+@pytest.mark.asyncio
+async def test_pick_all_slow_falls_back_to_least_slow():
+    """全部 IP 都超延迟上限时兜底选"最不慢"的那个（总比 503 强）。"""
+    pool = make_pool(
+        {"stable3": ["1.1.1.1:80", "2.2.2.2:80"], "stable2": [], "stable1": []},
+    )
+    pool._available = {
+        "1.1.1.1:80": {"quality": "stable3"},
+        "2.2.2.2:80": {"quality": "stable3"},
+    }
+    pool._warm = True
+    pool._update_latency("1.1.1.1:80", 30000)   # 都不达标
+    pool._update_latency("2.2.2.2:80", 20000)
+
+    got = await pool.get_proxy()
+    assert got == "2.2.2.2:80"   # 选延迟最低的兜底
+
+
+@pytest.mark.asyncio
+async def test_reverify_spotchecks_stale_members():
+    """闲置超过 stale_after_s 的正分成员会被真实请求重验（死了就剔）。"""
+    pool = make_pool(
+        {"stable3": ["1.1.1.1:80", "2.2.2.2:80"], "stable2": [], "stable1": []},
+        probe_results=OK,
+    )
+    pool._available = {
+        "1.1.1.1:80": {"quality": "stable3"},   # 闲置很久但正分
+        "2.2.2.2:80": {"quality": "stable3"},   # 刚用过
+    }
+    pool._warm = True
+    pool._bump_zen_score("1.1.1.1:80", +3)
+    pool._bump_zen_score("2.2.2.2:80", +3)
+    # 1.1.1.1 闲置超过 stale_after_s（900s），2.2.2.2 刚被用
+    import time
+    pool._last_used["1.1.1.1:80"] = time.time() - 10000
+    pool._last_used["2.2.2.2:80"] = time.time()
+
+    async def probe_fn(proxy: str) -> str:
+        # 闲置成员已死，刚用过的还活
+        return DEAD if proxy == "1.1.1.1:80" else OK
+
+    pool._probe_fn = probe_fn  # type: ignore[method-assign]
+
+    await pool._reverify_pool_members(2, 10)
+    assert "1.1.1.1:80" not in pool._available  # 僵尸被剔除
+    assert "2.2.2.2:80" in pool._available      # 新鲜成员不动
+
+
+@pytest.mark.asyncio
+async def test_reverify_stale_cap_limits_batch():
+    """闲置成员按最久没用优先，且最多抽查 stale_check_batch 个。"""
+    pool = make_pool(
+        {"stable3": ["1.1.1.1:80", "2.2.2.2:80", "3.3.3.3:80"],
+         "stable2": [], "stable1": []},
+        probe_results=OK,
+    )
+    # stale_check_batch=1：一次只抽查 1 个闲置成员
+    settings = make_settings(pool_target=3, stale_check_batch=1)
+    transport = httpx.MockTransport(
+        lambda r: httpx.Response(200, json={"code": 200, "data": []}))
+    pool = ProxyPool(settings, client=httpx.AsyncClient(transport=transport),
+                     probe_fn=pool._probe_fn)
+    pool._available = {
+        "1.1.1.1:80": {"quality": "stable3"},
+        "2.2.2.2:80": {"quality": "stable3"},
+        "3.3.3.3:80": {"quality": "stable3"},
+    }
+    pool._warm = True
+    import time
+    probed = []
+
+    async def probe_fn(proxy: str) -> str:
+        probed.append(proxy)
+        return OK
+
+    pool._probe_fn = probe_fn  # type: ignore[method-assign]
+    for i, p in enumerate(["1.1.1.1:80", "2.2.2.2:80", "3.3.3.3:80"]):
+        pool._bump_zen_score(p, +3)
+        pool._last_used[p] = time.time() - (10200 - i * 100)  # 1.1.1.1 最久
+
+    await pool._reverify_pool_members(2, 10)
+    assert len(probed) == 1               # 只抽查了 1 个
+    assert probed[0] == "1.1.1.1:80"      # 且是最久没用的那个
