@@ -117,7 +117,7 @@ class ProxyPool:
                 self._metrics["no_proxy_errors"] += 1
                 raise NoProxyAvailable("代理池无可用代理（全部被排除）")
             # 按 zen 命中历史分档：正分（对 zen 成功过）优先，负分兜底。
-            # 冷却恢复的 IP 多数仍连不上 zen，不能让它们和好 IP 同权重竞争。
+            # 冷却恢复 / 快照回灌的僵尸大多连不上 zen，不能让它们和好 IP 同权重。
             positive = [p for p in base_candidates if self._zen_score(p) > 0]
             if positive:
                 candidates = positive
@@ -126,8 +126,8 @@ class ProxyPool:
             pick = min(
                 candidates,
                 key=lambda p: (
-                    _as_int(self._store.get(_K_INFLIGHT + p)),   # 优先最空闲
-                    self._latency.get(p, 0.0),                    # 同空闲取延迟低
+                    _as_int(self._store.get(_K_INFLIGHT + p)),          # 优先最空闲
+                    self._latency.get(p, float("inf")),                 # 同空闲取延迟低；未验证=inf 最后
                 ),
             )
             # TTL 兜底：任何泄漏（异常/未归还）的计数 10 分钟后自动清除
@@ -164,6 +164,50 @@ class ProxyPool:
                 self._available.pop(proxy, None)
                 self._store.delete(_K_COOLDOWN + proxy)
                 self._bump_zen_score(proxy, -1)
+
+    async def _reverify_pool_members(self, concurrency: int, batch: int):
+        """重验池内可疑成员，剔除失效/被限流的僵尸 IP。
+
+        快照加载/冷却恢复容易把"已失效或刚被限流"的 IP 留在 _available，
+        它们在取号里挤占位置却连不上 zen → 全 429。这里只对**非正分**成员
+        （从未验证/历史失败过）做最小 chat 探测：OK 保留、429 进冷却、
+        DEAD 剔除；正分好 IP 不重复探测，避免消耗额度。
+        """
+        members = [
+            p for p in self._available
+            if not self._in_cooldown(p) and self._zen_score(p) <= 0
+        ]
+        if not members:
+            return
+        sem = asyncio.Semaphore(concurrency)
+
+        async def one(proxy: str) -> str | None:
+            async with sem:
+                v = self._available.get(proxy, {})
+                q = v.get("quality", "") if isinstance(v, dict) else ""
+                status = await self._probe_fn(proxy)
+                if status == OK:
+                    self._bump_zen_score(proxy, +1)
+                    return None
+                if status == COOLDOWN:
+                    self._mark_cooldown(
+                        proxy, q,
+                        cooldown_seconds=self._probe_retry.get(proxy, 0))
+                    return None
+                # DEAD/超时：从可用池移除，避免继续被取号
+                self._bump_zen_score(proxy, -1)
+                self._store.delete(_K_COOLDOWN + proxy)
+                return proxy
+
+        # 探测阶段不持主锁，只收集结果，最后并入（与补池一致，避免长持锁）
+        dead = [
+            p for p in await asyncio.gather(*(one(p) for p in members))
+            if p
+        ]
+        if dead:
+            async with self._refill_lock:
+                for p in dead:
+                    self._available.pop(p, None)
 
     def _update_latency(self, proxy: str, latency_ms: float):
         """EWMA 更新某 IP 的延迟估计，平滑抖动（α=0.3 偏重近期）。"""
@@ -270,6 +314,9 @@ class ProxyPool:
         if loaded:
             self._available = loaded
             self._warm = True
+            # 快照多为"冷却恢复后被限流/失效"的僵尸，直接可用会造成全 429。
+            # 立即后台重验池内成员（活的留、死的剔、429 进冷却），同时补新候选。
+            self._schedule_refill()
 
     def _mark_cooldown(self, proxy: str, quality: str = "",
                        cooldown_seconds: int = 0):
@@ -356,6 +403,9 @@ class ProxyPool:
         chain = self.settings.quality_chain
         probe_conc = min(self.settings.probe_concurrency, 10)
         batch = max(self.settings.probe_batch, 20)
+        # 先重验池内可疑成员：快照回灌/冷却恢复的僵尸"占位但连不上"，
+        # 不剔掉的话 _usable_count 虚高 → 补池停摆、取号专挑僵尸 → 全 429。
+        await self._reverify_pool_members(probe_conc, batch)
         for quality in chain:
             quality = quality.strip()
             raw = await self._fetch_candidates(quality)

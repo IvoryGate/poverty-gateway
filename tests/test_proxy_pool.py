@@ -329,3 +329,101 @@ async def test_zen_score_skips_known_bad():
     # 两个候选最终都会入池（排序只影响探测顺序，不硬跳过）
     assert "2.2.2.2:80" in pool._available
     assert "1.1.1.1:80" in pool._available
+
+
+@pytest.mark.asyncio
+async def test_reverify_removes_dead_members():
+    """重验池内成员：DEAD 剔除、OK 保留、429 进冷却。"""
+    pool = make_pool(
+        {"stable3": ["1.1.1.1:80", "2.2.2.2:80"], "stable2": [], "stable1": []},
+        probe_results=OK,
+    )
+    # 模拟快照回灌：三个成员里一个死了、一个被限流、一个活着
+    pool._available = {
+        "1.1.1.1:80": {"quality": "stable3"},
+        "2.2.2.2:80": {"quality": "stable3"},
+        "3.3.3.3:80": {"quality": "stable3"},
+    }
+    pool._warm = True
+
+    async def probe_fn(proxy: str) -> str:
+        return {"1.1.1.1:80": OK, "2.2.2.2:80": DEAD,
+                "3.3.3.3:80": COOLDOWN}[proxy]
+
+    pool._probe_fn = probe_fn  # type: ignore[method-assign]
+    pool._probe_retry["3.3.3.3:80"] = 0
+
+    await pool._reverify_pool_members(2, 10)
+    assert "1.1.1.1:80" in pool._available      # 活着 → 保留
+    assert "2.2.2.2:80" not in pool._available  # 死了 → 剔除
+    assert "3.3.3.3:80" in pool._available      # 429 → 保留占位但进冷却
+    assert pool._store.exists("cooldown:3.3.3.3:80")
+
+
+@pytest.mark.asyncio
+async def test_refill_reverifies_existing_then_probes_new():
+    """补池先重验池内成员，再探测新候选。"""
+    get_calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url).startswith("http://pool.test/get"):
+            get_calls["n"] += 1
+        return httpx.Response(200, json={"code": 200,
+                                         "data": ["9.9.9.9:80", "8.8.8.8:80"]})
+
+    async def probe_fn(proxy: str) -> str:
+        # 池内僵尸死亡，新候选可用
+        if proxy in ("1.1.1.1:80",):
+            return DEAD
+        return OK
+
+    transport = httpx.MockTransport(handler)
+    client = httpx.AsyncClient(transport=transport)
+    pool = ProxyPool(
+        make_settings(pool_target=3, pool_low_water=1, quality_chain="stable3"),
+        client=client, probe_fn=probe_fn,
+    )
+    pool._available = {"1.1.1.1:80": {"quality": "stable3"}}
+    pool._warm = True
+
+    await pool._refill()
+    assert "1.1.1.1:80" not in pool._available       # 僵尸被重验剔除
+    assert "9.9.9.9:80" in pool._available           # 新候选入池
+    assert "8.8.8.8:80" in pool._available
+
+
+@pytest.mark.asyncio
+async def test_pick_prefers_low_latency():
+    """同可用的 IP 里优先选延迟低、in-flight 少的。"""
+    pool = make_pool(
+        {"stable3": ["1.1.1.1:80", "2.2.2.2:80"], "stable2": [], "stable1": []},
+    )
+    pool._available = {
+        "1.1.1.1:80": {"quality": "stable3"},
+        "2.2.2.2:80": {"quality": "stable3"},
+    }
+    pool._warm = True
+    pool._update_latency("1.1.1.1:80", 8000)   # 慢
+    pool._update_latency("2.2.2.2:80", 2000)   # 快
+
+    # 冷启动补池一次后，两次取号都应是延迟低的 2.2.2.2（除非 in-flight 抢占）
+    got = await pool.get_proxy()
+    assert got == "2.2.2.2:80"
+
+
+@pytest.mark.asyncio
+async def test_pick_prefers_positive_score_over_bad():
+    """正分 IP 优先于负分 IP（僵尸不占养号位置）。"""
+    pool = make_pool(
+        {"stable3": ["1.1.1.1:80", "2.2.2.2:80"], "stable2": [], "stable1": []},
+    )
+    pool._available = {
+        "1.1.1.1:80": {"quality": "stable3"},
+        "2.2.2.2:80": {"quality": "stable3"},
+    }
+    pool._warm = True
+    pool._bump_zen_score("1.1.1.1:80", -3)
+    pool._bump_zen_score("2.2.2.2:80", +3)
+
+    got = await pool.get_proxy()
+    assert got == "2.2.2.2:80"

@@ -62,8 +62,10 @@ class Settings:
         # 探测/冷启动使用的最小 chat 模型（能出对话即视为可用）
         self.probe_model = self._get("PROBE_MODEL", "deepseek-v4-flash-free")
 
-        # 可用池目标规模：补池到此数即停（候选源持续增长，多 key 需更大池）
-        self.pool_target = self._get_int("POOL_TARGET", 60)
+        # 可用池目标规模：补池到此数即停（候选源持续增长，多 key 需更大池）。
+        # 阶段 16：源库存充足（stable3 ~160+），池子越大 = 更多已验证的好 IP
+        # 缓冲，分摊 429 与延迟；补池会先重验去僵尸，大池不等于垃圾占位。
+        self.pool_target = self._get_int("POOL_TARGET", 90)
 
         # 可用池低水位：低于 target 的 2/3 触发补池（默认），可用环境变量覆盖
         self.pool_low_water = self._get_int(
