@@ -59,7 +59,7 @@ pip install -r requirements.txt
 ## 测试
 
 ```bash
-.venv/bin/python -m pytest      # 53 passed
+.venv/bin/python -m pytest      # 59 passed
 .venv/bin/ruff check .          # All checks passed
 ```
 

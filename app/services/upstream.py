@@ -94,6 +94,8 @@ class UpstreamClient:
         upstream_model = self.models.to_upstream(public_model)
         payload = dict(payload)
         payload["model"] = upstream_model
+        if endpoint == "chat/completions":
+            payload = _normalize_chat_payload(payload)
 
         last_err = None
         excluded: set[str] = set()
@@ -144,6 +146,8 @@ class UpstreamClient:
         payload = dict(payload)
         payload["model"] = upstream_model
         payload["stream"] = True
+        if endpoint == "chat/completions":
+            payload = _normalize_chat_payload(payload)
 
         last_err = None
         excluded: set[str] = set()
@@ -215,6 +219,7 @@ class UpstreamClient:
                 f"upstream {r.status_code}: {detail}",
                 retry_after=_parse_retry_after(r),
                 status_code=r.status_code,
+                error_body=_parse_error_body(r),
             )
         return r.json()
 
@@ -235,6 +240,7 @@ class UpstreamClient:
                     f"upstream {r.status_code}: {detail}",
                     retry_after=_parse_retry_after(r),
                     status_code=r.status_code,
+                    error_body=_parse_error_body(r),
                 )
             async for chunk in r.aiter_bytes():
                 yield chunk
@@ -261,6 +267,7 @@ class UpstreamClient:
                     f"upstream {r.status_code}: {detail}",
                     retry_after=_parse_retry_after(r),
                     status_code=r.status_code,
+                    error_body=_parse_error_body(r),
                 )
             state = {"started": False, "rid": None, "item_id": None}
             async for event in _iter_sse_events(r):
@@ -299,10 +306,12 @@ class UpstreamClient:
 class UpstreamError(Exception):
     """上游返回错误。"""
 
-    def __init__(self, message: str, retry_after: int = 0, status_code: int = 0):
+    def __init__(self, message: str, retry_after: int = 0, status_code: int = 0,
+                 error_body: dict | None = None):
         super().__init__(message)
         self.retry_after = retry_after
         self.status_code = status_code
+        self.error_body = error_body or {}
 
 
 def _parse_retry_after(r) -> int:
@@ -314,6 +323,50 @@ def _parse_retry_after(r) -> int:
         return max(int(val.strip()), 0)
     except (TypeError, ValueError):
         return 0
+
+
+def _parse_error_body(r) -> dict:
+    """从上游错误响应里提取标准 OpenAI error 对象，供网关重包装。
+
+    上游多数返回 {"error": {...}}；个别用 {"detail": ...} 或裸消息。能解析出
+    error 对象则返回它，否则返回空 dict（调用方降级用 message 兜底）。
+    """
+    try:
+        obj = json.loads(r.text)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(obj, dict):
+        return {}
+    err = obj.get("error")
+    if isinstance(err, dict):
+        return err
+    for key in ("message", "detail"):
+        if key in obj and isinstance(obj[key], str):
+            return {"type": "invalid_request_error", "message": obj[key]}
+    return {}
+
+
+def _normalize_chat_payload(payload: dict) -> dict:
+    """归一化 chat 请求里的 assistant 消息，规避上游 reasoning_content 校验。
+
+    zen/DeepSeek 推理模型要求：会话中出现过真实思考过的 assistant 消息后，
+    后续同位置的 assistant 消息必须带 reasoning_content（须回传）。实测空串
+    "" 合法。这里给「缺该字段」的 assistant 消息统一补空串，避免客户端
+    （DSH/pi-ai 等）因历史消息没带字段被上游 400。已有该字段的不动。
+    """
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        return payload
+    normalized = list(messages)
+    changed = False
+    for i, m in enumerate(normalized):
+        if isinstance(m, dict) and m.get("role") == "assistant" \
+                and "reasoning_content" not in m:
+            normalized[i] = dict(m, reasoning_content="")
+            changed = True
+    if not changed:
+        return payload
+    return dict(payload, messages=normalized)
 
 
 def _classify(status_code: int) -> str:

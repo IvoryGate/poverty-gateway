@@ -168,6 +168,47 @@ async def test_circuit_breaker_trips_on_many_failures():
             pass
 
 
+def test_normalize_chat_payload_adds_empty_reasoning():
+    """assistant 消息缺 reasoning_content → 网关自动补空串；已有值不动。"""
+    from app.services.upstream import _normalize_chat_payload
+
+    payload = {"model": "x", "messages": [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "ok"},
+        {"role": "assistant", "content": "t", "reasoning_content": "think"},
+        {"role": "system", "content": "sys"},
+    ]}
+    out = _normalize_chat_payload(payload)
+    assert out["messages"][1]["reasoning_content"] == ""
+    assert out["messages"][2]["reasoning_content"] == "think"
+    assert "reasoning_content" not in out["messages"][3]
+    assert out["messages"][0] == payload["messages"][0]
+
+
+def test_normalize_chat_payload_no_messages():
+    """无 messages 或全都有了 → 原对象原样返回。"""
+    from app.services.upstream import _normalize_chat_payload
+
+    raw = {"model": "x"}
+    assert _normalize_chat_payload(raw) is raw
+    raw2 = {"model": "x", "messages": [{"role": "assistant",
+                                        "content": "a", "reasoning_content": ""}]}
+    assert _normalize_chat_payload(raw2) is raw2
+
+
+def test_parse_error_body_extracts_error():
+    """上游错误 body 解析：OpenAI error 结构 / detail 兜底。"""
+    from app.services.upstream import _parse_error_body
+
+    r1 = httpx.Response(400, json={
+        "error": {"type": "invalid_request_error", "message": "bad param"}})
+    assert _parse_error_body(r1)["message"] == "bad param"
+    r2 = httpx.Response(400, json={"detail": "plain message"})
+    assert _parse_error_body(r2)["message"] == "plain message"
+    r3 = httpx.Response(502, content=b"not json")
+    assert _parse_error_body(r3) == {}
+
+
 def test_sanitize_responses_removes_web_search():
     """responses 请求剔除 web_search 等 zen 不支持的工具。"""
     payload = {

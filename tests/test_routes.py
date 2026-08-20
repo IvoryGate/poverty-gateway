@@ -174,6 +174,97 @@ async def test_auth_valid_key_passes():
 
 
 @pytest.mark.asyncio
+async def test_upstream_4xx_passthrough_not_502():
+    """response_format=json_object 被上游拒 → 网关透传 400 + 标准 error 结构，
+    不包装成 502。"""
+    from app.services.upstream import UpstreamError
+
+    app = make_app(lambda r: httpx.Response(200, json={}))
+
+    async def fail_chat(model, payload):
+        raise UpstreamError(
+            "upstream 400: bad", status_code=400,
+            error_body={"type": "invalid_request_error",
+                        "code": "unsupported_parameter",
+                        "message": "json_object not supported"})
+
+    app.state.upstream.chat = fail_chat  # type: ignore[method-assign]
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        r = await ac.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer sk-alice"},
+            json={"model": "deepseek-v4-flash-lite",
+                  "messages": [{"role": "user", "content": "hi"}],
+                  "response_format": {"type": "json_object"}})
+    assert r.status_code == 400
+    body = r.json()
+    assert body["error"]["type"] == "invalid_request_error"
+    assert body["error"]["code"] == "unsupported_parameter"
+    assert body["error"]["message"] == "json_object not supported"
+
+
+@pytest.mark.asyncio
+async def test_upstream_429_retry_after_standard():
+    """上游限流 → 网关 429 + Retry-After + 标准 rate_limit_error 结构。"""
+    from app.services.upstream import UpstreamError
+
+    app = make_app(lambda r: httpx.Response(200, json={}))
+
+    async def fail_chat(model, payload):
+        raise UpstreamError(
+            "upstream 429: rate limited", status_code=429, retry_after=17,
+            error_body={"type": "FreeUsageLimitError", "message": "Rate limited"})
+
+    app.state.upstream.chat = fail_chat  # type: ignore[method-assign]
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        r = await ac.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer sk-alice"},
+            json={"model": "deepseek-v4-flash-lite",
+                  "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 429
+    assert r.headers.get("retry-after") == "17"
+    body = r.json()
+    assert body["error"]["type"] == "rate_limit_error"
+
+
+@pytest.mark.asyncio
+async def test_assistant_reasoning_content_normalized():
+    """多轮对话：assistant 消息缺 reasoning_content → 网关自动补空串再转发。"""
+    import json as _json
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["payload"] = _json.loads(request.content)
+        return httpx.Response(200, json={
+            "id": "x", "object": "chat.completion", "created": 0,
+            "model": "deepseek-v4-flash-lite",
+            "choices": [{"index": 0, "finish_reason": "stop",
+                         "message": {"role": "assistant", "content": "ok"}}],
+        })
+
+    app = make_app(handler)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        r = await ac.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer sk-alice"},
+            json={"model": "deepseek-v4-flash-lite",
+                  "messages": [
+                      {"role": "user", "content": "hi"},
+                      {"role": "assistant", "content": "first reply"},
+                      {"role": "user", "content": "again"},
+                  ]})
+    assert r.status_code == 200
+    msgs = seen["payload"]["messages"]
+    assert msgs[1]["reasoning_content"] == ""
+    # 正常回复字段不被破坏
+    assert msgs[1]["content"] == "first reply"
+
+
+@pytest.mark.asyncio
 async def test_rate_limit_429():
     """每 key rpm 用尽 → 429。"""
     def handler(request: httpx.Request) -> httpx.Response:

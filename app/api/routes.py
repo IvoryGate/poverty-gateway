@@ -11,7 +11,7 @@ import os
 import time
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from app.core.auth import AuthError, AuthManager, RateLimitExceeded
 from app.core.proxy_pool import NoProxyAvailable
@@ -108,11 +108,11 @@ async def _responses(request: Request, key: str):
                     yield chunk
                     ti, to = _scan_stream_usage(chunk, ti, to)
             except KeyError as e:
-                yield _sse_error(f"Unknown model: {e}")
+                yield _sse_error(f"Unknown model: {e}", "invalid_request_error")
             except NoProxyAvailable as e:
                 yield _sse_error(str(e))
             except UpstreamError as e:
-                yield _sse_error(str(e))
+                yield _sse_error(str(e), _sse_error_type(e))
             finally:
                 usage.record(key, success=ok,
                              latency_ms=(time.time() - t0) * 1000,
@@ -129,7 +129,7 @@ async def _responses(request: Request, key: str):
     except NoProxyAvailable as e:
         raise HTTPException(status_code=503, detail=str(e))
     except UpstreamError as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        return _upstream_error(e)
     usage.record(key, success=True, latency_ms=(time.time() - t0) * 1000)
     return result
 
@@ -161,7 +161,7 @@ async def _chat_completions(request: Request, key: str):
     except NoProxyAvailable as e:
         raise HTTPException(status_code=503, detail=str(e))
     except UpstreamError as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        return _upstream_error(e)
     finally:
         pass
     usage.record(key, success=True, latency_ms=(time.time() - t0) * 1000,
@@ -184,11 +184,11 @@ async def _stream_completions(client: UpstreamClient, model: str, payload: dict,
                 yield chunk
                 ti, to = _scan_stream_usage(chunk, ti, to)
         except KeyError as e:
-            yield _sse_error(f"Unknown model: {e}")
+            yield _sse_error(f"Unknown model: {e}", "invalid_request_error")
         except NoProxyAvailable as e:
             yield _sse_error(str(e))
         except UpstreamError as e:
-            yield _sse_error(str(e))
+            yield _sse_error(str(e), _sse_error_type(e))
         finally:
             usage.record(key, success=ok, latency_ms=(time.time() - t0) * 1000,
                          tokens_in=ti, tokens_out=to)
@@ -200,10 +200,51 @@ async def _stream_completions(client: UpstreamClient, model: str, payload: dict,
     )
 
 
-def _sse_error(message: str) -> bytes:
+def _sse_error(message: str, err_type: str = "proxy_pool_error") -> bytes:
     """把错误编码为 SSE error 事件（兼容 OpenAI 客户端解析）。"""
-    body = {"error": {"message": message, "type": "proxy_pool_error"}}
+    body = {"error": {"message": message, "type": err_type, "param": None}}
     return f"data: {json.dumps(body)}\n\n".encode()
+
+
+def _sse_error_type(e: UpstreamError) -> str:
+    """从上游错误里推断 SSE error 事件的 type（429→rate_limit_error 等）。"""
+    if e.status_code == 429:
+        return "rate_limit_error"
+    body = e.error_body or {}
+    t = body.get("type")
+    return t if isinstance(t, str) and t else "upstream_error"
+
+
+def _upstream_error(e: UpstreamError) -> JSONResponse:
+    """把上游错误转成客户可识别的响应，而不是一律 502：
+
+    - 上游 4xx（如 response_format=json_object 被上游拒绝）→ 同码透传，
+      并保留上游 error 对象，客户端可识别"参数/格式不支持"并优雅降级；
+    - 上游 429 → 429 + Retry-After + 标准 rate_limit_error 结构，便于退避；
+    - 其余（5xx / 连接失败 / 熔断）→ 502 网关兜底。
+    """
+    body = e.error_body or {}
+    msg = body.get("message") or str(e)
+    if e.status_code == 429:
+        etype = "rate_limit_error"
+    elif isinstance(body.get("type"), str) and body.get("type"):
+        etype = body["type"]
+    else:
+        etype = "invalid_request_error"
+    error = {"message": msg, "type": etype, "param": None}
+    if body.get("code"):
+        error["code"] = body["code"]
+
+    if e.status_code == 429:
+        status = 429
+        headers = {}
+        if e.retry_after:
+            headers["Retry-After"] = str(e.retry_after)
+        return JSONResponse(status_code=status, content={"error": error},
+                            headers=headers or None)
+    if e.status_code and 400 <= e.status_code < 500:
+        return JSONResponse(status_code=e.status_code, content={"error": error})
+    return JSONResponse(status_code=502, content={"error": error})
 
 
 def _usage_num(result: dict, key: str) -> int:
