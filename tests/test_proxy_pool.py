@@ -333,7 +333,7 @@ async def test_zen_score_skips_known_bad():
 
 @pytest.mark.asyncio
 async def test_reverify_removes_dead_members():
-    """重验池内成员：DEAD 剔除、OK 保留、429 进冷却。"""
+    """重验池内成员：DEAD 剔除、OK 保留、429 保留但降优先级（不冷却）。"""
     pool = make_pool(
         {"stable3": ["1.1.1.1:80", "2.2.2.2:80"], "stable2": [], "stable1": []},
         probe_results=OK,
@@ -356,8 +356,10 @@ async def test_reverify_removes_dead_members():
     await pool._reverify_pool_members(2, 10)
     assert "1.1.1.1:80" in pool._available      # 活着 → 保留
     assert "2.2.2.2:80" not in pool._available  # 死了 → 剔除
-    assert "3.3.3.3:80" in pool._available      # 429 → 保留占位但进冷却
-    assert pool._store.exists("cooldown:3.3.3.3:80")
+    assert "3.3.3.3:80" in pool._available      # 429 → 保留（限流可恢复）
+    # 429 不写冷却键（避免探测全撞 429 塞满冷却区饿死池），但要降优先级
+    assert not pool._store.exists("cooldown:3.3.3.3:80")
+    assert pool._zen_score("3.3.3.3:80") < 0
 
 
 @pytest.mark.asyncio

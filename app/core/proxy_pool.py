@@ -211,17 +211,15 @@ class ProxyPool:
 
         async def one(proxy: str) -> str | None:
             async with sem:
-                v = self._available.get(proxy, {})
-                q = v.get("quality", "") if isinstance(v, dict) else ""
                 status = await self._probe_fn(proxy)
                 if status == OK:
                     self._bump_zen_score(proxy, +1)
                     self._last_used[proxy] = time.time()
                     return None
                 if status == COOLDOWN:
-                    self._mark_cooldown(
-                        proxy, q,
-                        cooldown_seconds=self._probe_retry.get(proxy, 0))
+                    # 与 _probe_all 一致：探测 429 不冷却，改记连续次数，
+                    # 连续 3 次扣 zen_score 降优先级（可救，非死 IP）。
+                    self._bump_zen_score(proxy, -1)
                     return None
                 # DEAD/超时：从可用池移除，避免继续被取号
                 self._bump_zen_score(proxy, -1)
@@ -533,10 +531,16 @@ class ProxyPool:
                     self._last_used[proxy] = time.time()
                     return proxy
                 if status == COOLDOWN:
-                    # 探测 429：用上游 retry-after（若有）精确冷却，避免反复探测
-                    self._mark_cooldown(
-                        proxy, quality,
-                        cooldown_seconds=self._probe_retry.get(proxy, 0))
+                    # 探测 429：**不冷却**（429 是上游限流不是代理坏，一次
+                    # 探测全撞 429 会把冷却区塞满、饿死 available，如阶段 17
+                    # 池里大量 cloudflare 免费 IP 出口被 zen 限流的场景）。
+                    # 改为记连续 429 次数，连续 3 次以上扣 zen_score 降低
+                    # 优先级，下次补池减少尝试，但 IP 保留可救（限流恢复后
+                    # 能重新通过）。
+                    self._probe_retry[proxy] = self._probe_retry.get(proxy, 0) + 1
+                    if self._probe_retry[proxy] >= 3:
+                        self._bump_zen_score(proxy, -1)
+                        self._probe_retry.pop(proxy, None)
                 else:
                     # DEAD/超时/连不上：记忆负面表现，下次补池降低优先级
                     self._bump_zen_score(proxy, -1)
