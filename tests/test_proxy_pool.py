@@ -532,3 +532,39 @@ async def test_reverify_stale_cap_limits_batch():
     await pool._reverify_pool_members(2, 10)
     assert len(probed) == 1               # 只抽查了 1 个
     assert probed[0] == "1.1.1.1:80"      # 且是最久没用的那个
+
+
+@pytest.mark.asyncio
+async def test_fetch_from_api_type_matches_http_switch():
+    """http 开关开时 /get 回退取 type=http，否则 type=https。"""
+    captured = {}
+
+    def pool_handler(request: httpx.Request) -> httpx.Response:
+        captured["type"] = request.url.params.get("type")
+        return httpx.Response(200, json={"code": 200,
+                                         "data": ["1.1.1.1:80"]})
+
+    # http 开关开 → type=http
+    pool = ProxyPool(
+        make_settings(upstream_use_http=True),
+        client=httpx.AsyncClient(transport=httpx.MockTransport(pool_handler)),
+        probe_fn=pool_noop_probe,
+    )
+    pool._read_all_from_redis = list  # type: ignore[method-assign]
+    got = await pool._fetch_from_api("stable3")
+    assert captured["type"] == "http"
+    assert got == ["1.1.1.1:80"]
+
+    # http 开关关 → type=https
+    pool2 = ProxyPool(
+        make_settings(upstream_use_http=False),
+        client=httpx.AsyncClient(transport=httpx.MockTransport(pool_handler)),
+        probe_fn=pool_noop_probe,
+    )
+    pool2._read_all_from_redis = list  # type: ignore[method-assign]
+    await pool2._fetch_from_api("stable3")
+    assert captured["type"] == "https"
+
+
+async def pool_noop_probe(proxy: str) -> str:
+    return OK

@@ -491,7 +491,10 @@ class ProxyPool:
                 clean, decode_responses=True, socket_connect_timeout=3,
                 socket_timeout=3,
             )
-            keys = r.hkeys("use_proxy") or []
+            # use_proxy 是 Set（proxy-pool 用 sadd/srem 维护）：读全量成员。
+            # 之前误用 hkeys（哈希）→ WRONGTYPE 空结果 → 回退 /get?type=https
+            # 只吃到 50 个 https 代理，1556 个 http-only 全被浪费（可用饿死）。
+            keys = r.smembers("use_proxy") or set()
             return [str(k) for k in keys if k]
         except (redis_py.RedisError, ImportError, ValueError):
             return []
@@ -501,7 +504,7 @@ class ProxyPool:
         url = f"{self.settings.proxy_pool_url}/get"
         params = {
             "need": "global",
-            "type": "https",
+            "type": "http" if self.settings.upstream_use_http else "https",
             "count": self.settings.batch_size,
             "quality": quality,
         }
