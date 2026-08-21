@@ -33,8 +33,10 @@ DEAD = "dead"             # 连接失败，剔除
 # Redis 键前缀
 _K_INFLIGHT = "inflight:"   # in-flight 计数
 _K_COOLDOWN = "cooldown:"   # 冷却区（值 = "strike:quality"，带 TTL）
+_K_LATENCY = "latency:"     # 延迟估计（ms，EWMA，跨 worker 共享，TTL 6h）
 _K_SNAPSHOT = "pool_snapshot"   # 可用池快照（JSON，TTL 24h）
 _SNAPSHOT_TTL = 86400
+_LATENCY_TTL = 6 * 3600
 
 
 def _as_int(raw) -> int:
@@ -123,11 +125,22 @@ class ProxyPool:
                 candidates = positive
             else:
                 candidates = base_candidates
+            # 延迟上限过滤（阶段 17 移植）：已知延迟超过 max_latency_ms 的
+            # 直接剔除，防止慢/挂代理被选中拖垮请求（回退版缺此逻辑，池里
+            # 未测速/超慢 IP 全被挑中导致 50s 超时）。
+            # 未采样延迟按 inf 处理（而非 0）：无样本=不知道快慢，不应插队。
+            fast = [
+                p for p in candidates
+                if self._latency_of(p) is None
+                or self._latency_of(p) <= self.settings.max_latency_ms
+            ]
+            if fast:
+                candidates = fast
             pick = min(
                 candidates,
                 key=lambda p: (
                     _as_int(self._store.get(_K_INFLIGHT + p)),   # 优先最空闲
-                    self._latency.get(p, 0.0),                    # 同空闲取延迟低
+                    self._latency_of(p) or float("inf"),          # 同空闲取延迟低
                 ),
             )
             # TTL 兜底：任何泄漏（异常/未归还）的计数 10 分钟后自动清除
@@ -166,12 +179,30 @@ class ProxyPool:
                 self._bump_zen_score(proxy, -1)
 
     def _update_latency(self, proxy: str, latency_ms: float):
-        """EWMA 更新某 IP 的延迟估计，平滑抖动（α=0.3 偏重近期）。"""
-        old = self._latency.get(proxy)
+        """EWMA 更新某 IP 的延迟估计，平滑抖动（α=0.3 偏重近期）。
+
+        存 Redis（key=latency:<proxy>, TTL 6h）跨 worker 共享——多 worker
+        各持内存表会导致延迟过滤失效（另一个 worker 的采样看不到）。
+        """
+        old = self._latency_of(proxy)
         if old is None:
-            self._latency[proxy] = float(latency_ms)
+            new = float(latency_ms)
         else:
-            self._latency[proxy] = 0.3 * float(latency_ms) + 0.7 * old
+            new = 0.3 * float(latency_ms) + 0.7 * old
+        try:
+            self._store.setex(_K_LATENCY + proxy, _LATENCY_TTL, str(round(new, 1)))
+        except Exception:
+            self._latency[proxy] = new
+
+    def _latency_of(self, proxy: str) -> float | None:
+        """读某 IP 的延迟估计（ms）。先 Redis（跨 worker 共享）后内存。"""
+        try:
+            raw = self._store.get(_K_LATENCY + proxy)
+            if raw is not None:
+                return float(raw)
+        except Exception:
+            pass
+        return self._latency.get(proxy)
 
     def note_error(self, kind: str):
         """记一次错误分类（429/5xx/4xx/timeout/conn），供面板拆解错误率。"""
@@ -185,8 +216,17 @@ class ProxyPool:
         cooldown_n = len(self._store.keys(_K_COOLDOWN + "*"))
         # 真实可用 = 不在冷却中的占位（冷却的不算可用）
         usable = self._usable_count()
-        lat = sorted(self._latency.values()) if self._latency else []
-        latency_median = lat[len(lat) // 2] if lat else 0.0
+        lat = self._store.keys(_K_LATENCY + "*")
+        lat_vals = []
+        for k in lat:
+            v = self._store.get(k)
+            if v is not None:
+                try:
+                    lat_vals.append(float(v))
+                except (TypeError, ValueError):
+                    pass
+        lat_vals.sort()
+        latency_median = lat_vals[len(lat_vals) // 2] if lat_vals else 0.0
         return {
             "available": usable,
             "pool_size": len(self._available),
@@ -199,7 +239,7 @@ class ProxyPool:
             "dead_reports": self._metrics["dead_reports"],
             "no_proxy_errors": self._metrics["no_proxy_errors"],
             "latency_median_ms": round(latency_median, 1),
-            "latency_sampled": len(self._latency),
+            "latency_sampled": len(lat),
             "errors": dict(self._metrics["errors"]),
         }
 
@@ -450,6 +490,10 @@ class ProxyPool:
                 status = await self._probe_fn(proxy)
                 if status == OK:
                     self._bump_zen_score(proxy, +1)
+                    # 探测成功必须清掉残留的 cooldown key：另一 worker 曾对
+                    # 同一 IP 探测 429 打过冷却，不清的话本 worker 的 _available
+                    # 里虽有它，get_proxy 仍会被 cooldown 过滤掉（跨 worker 撕裂）。
+                    self._store.delete(_K_COOLDOWN + proxy)
                     return proxy
                 if status == COOLDOWN:
                     # 探测 429：用上游 retry-after（若有）精确冷却，避免反复探测

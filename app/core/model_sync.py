@@ -74,19 +74,19 @@ class ModelSync:
         return self._pool or ProxyPool(self.settings)
 
     async def _fetch_free_models(self) -> list[str]:
-        """经代理拉取上游模型列表，筛出 free 模型 id。"""
+        """直连上游拉取模型列表，筛出 free 模型 id。
+
+        注意：改直连而非经代理。之前经代理拉取会卡在 pool.get_proxy()
+        （代理池冷启动 refill 慢/无代理），导致同步长期失败、Redis 里的
+        模型映射永远不更新——客户端只看到旧列表，新 free 模型（hy3/
+        nemotron/muse 等）发现不了。读模型列表不涉及流量转发，直连安全。
+        真正的模型可用性探测（_probe_model）仍走代理池。
+        """
         import httpx
 
-        pool = self._get_pool()
-        try:
-            pool_proxy = await pool.get_proxy()
-        except NoProxyAvailable:
-            return []
         url = f"{self.settings.upstream_base}/models"
         try:
-            async with httpx.AsyncClient(
-                proxy=f"http://{pool_proxy}", timeout=15
-            ) as client:
+            async with httpx.AsyncClient(timeout=20, verify=False) as client:
                 r = await client.get(url, headers=zen_headers())
             if r.status_code != 200:
                 return []
@@ -96,15 +96,13 @@ class ModelSync:
             return [i for i in ids if "-free" in i]
         except httpx.HTTPError:
             return []
-        finally:
-            pool.release(pool_proxy)
 
     async def _probe_model(self, model: str) -> bool:
         """经代理池对单个模型做最小 chat 探测（能出对话即可用）。"""
         pool = self._get_pool()
         try:
-            proxy = await pool.get_proxy()
-        except NoProxyAvailable:
+            proxy = await asyncio.wait_for(pool.get_proxy(), timeout=20)
+        except (NoProxyAvailable, asyncio.TimeoutError):
             return False
         url = f"{self.settings.upstream_base}/chat/completions"
         body = {
@@ -124,13 +122,22 @@ class ModelSync:
             pool.release(proxy)
 
     async def run_forever(self):
-        """后台循环：定期同步（多 worker 用 Redis 锁只让一个执行）。"""
+        """后台循环：定期同步（多 worker 用 Redis 锁只让一个执行）。
+
+        同步整体加超时：_probe_model 的 get_proxy 在代理池冷启动时可能很慢，
+        不让它无限卡死占住这个协程；超时失败下轮（1h 后）重试。
+        """
         interval = self.settings.model_sync_interval
         while True:
             try:
-                if self._acquire_lock(interval):
+                # 锁 TTL 用短值（5 分钟）：sync 卡死/超时后锁自动过期，
+                # 不会把其它 worker 的同步挡掉一整轮（原来用 interval 当 TTL，
+                # 卡一次要等 1h 才能再抢到锁）。
+                if self._acquire_lock(300):
                     try:
-                        await self.sync_once()
+                        await asyncio.wait_for(self.sync_once(), timeout=180)
+                    except asyncio.TimeoutError:
+                        logger.warning("model sync timed out, will retry next interval")
                     finally:
                         self._release_lock()
             except (httpx.HTTPError, NoProxyAvailable, OSError) as e:

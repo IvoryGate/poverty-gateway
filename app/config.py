@@ -49,6 +49,10 @@ class Settings:
         # 单次从 proxy-pool 批量取的候选数（proxy-pool 实测最多稳定给 ~14 个）
         self.batch_size = self._get_int("BATCH_SIZE", 14)
 
+        # 选号延迟硬上限（ms）：超过此值的 IP 不再被选中（宁缺毋滥）。
+        # 从"只按延迟排序"升级为"直接过滤"，避免慢/挂代理拖垮请求延迟。
+        self.max_latency_ms = self._get_int("MAX_LATENCY_MS", 15000)
+
         # 对候选 IP 做 zen 连通性筛选的并发数（探测克制，防自我限流。
         # 3 太低——几百个候选分批串行探测很慢，补池筛不完；8 兼顾并发与克制）
         self.probe_concurrency = self._get_int("PROBE_CONCURRENCY", 8)
@@ -60,7 +64,7 @@ class Settings:
         self.probe_timeout = self._get_float("PROBE_TIMEOUT", 5)
 
         # 探测/冷启动使用的最小 chat 模型（能出对话即视为可用）
-        self.probe_model = self._get("PROBE_MODEL", "deepseek-v4-flash-free")
+        self.probe_model = self._get("PROBE_MODEL", "mimo-v2.5-free")
 
         # 可用池目标规模：补池到此数即停（候选源持续增长，多 key 需更大池）
         self.pool_target = self._get_int("POOL_TARGET", 60)
@@ -97,7 +101,7 @@ class Settings:
         self.cb_open_seconds = self._get_int("CB_OPEN_SECONDS", 15)  # 熔断时长
 
         # 模型源同步：自动发现/摘除 free 模型（一天一次足够，上游不会频繁调整）
-        self.model_sync_interval = self._get_int("MODEL_SYNC_INTERVAL", 86400)  # 秒
+        self.model_sync_interval = self._get_int("MODEL_SYNC_INTERVAL", 3600)  # 秒
 
         # 禁用模型名单（逗号分隔），自动同步时排除
         deny = self._get("MODEL_DENYLIST", "")
