@@ -132,17 +132,8 @@ def gateway_headers(key: str) -> dict:
 
 
 def upstream_headers() -> dict:
-    import uuid
-    return {
-        "Authorization": "Bearer public",
-        "Content-Type": "application/json",
-        "User-Agent": "opencode/1.15.0",
-        "x-api-key": "public",
-        "x-opencode-client": "cli",
-        "x-opencode-project": "global",
-        "x-opencode-request": f"msg_{uuid.uuid4().hex[:20]}",
-        "x-opencode-session": f"ses_{uuid.uuid4().hex[:20]}",
-    }
+    from app.core.headers import zen_headers
+    return zen_headers()
 
 
 async def run(args):

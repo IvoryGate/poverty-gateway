@@ -216,12 +216,14 @@ def _sse_error_type(e: UpstreamError) -> str:
 
 
 def _upstream_error(e: UpstreamError) -> JSONResponse:
-    """把上游错误转成客户可识别的响应，而不是一律 502：
+    """把上游错误转成客户可识别的响应：
 
     - 上游 4xx（如 response_format=json_object 被上游拒绝）→ 同码透传，
       并保留上游 error 对象，客户端可识别"参数/格式不支持"并优雅降级；
     - 上游 429 → 429 + Retry-After + 标准 rate_limit_error 结构，便于退避；
-    - 其余（5xx / 连接失败 / 熔断）→ 502 网关兜底。
+    - 其余（5xx / 连接失败 / 熔断）→ **503** 网关兜底。
+      不用 502：502 的 body 在出网时容易被中间层（CDN/反代）替换成自己的
+      HTML 错误页，客户端就拿不到结构化 error；503 与 4xx/429 一样保留 JSON。
     """
     body = e.error_body or {}
     msg = body.get("message") or str(e)
@@ -229,8 +231,10 @@ def _upstream_error(e: UpstreamError) -> JSONResponse:
         etype = "rate_limit_error"
     elif isinstance(body.get("type"), str) and body.get("type"):
         etype = body["type"]
+    elif e.status_code and 400 <= e.status_code < 500:
+        etype = "invalid_request_error"     # 上游拒的是请求本身
     else:
-        etype = "invalid_request_error"
+        etype = "upstream_error"            # 连接失败 / 熔断 / 上游 5xx，与 SSE 口径一致
     error = {"message": msg, "type": etype, "param": None}
     if body.get("code"):
         error["code"] = body["code"]
@@ -244,7 +248,9 @@ def _upstream_error(e: UpstreamError) -> JSONResponse:
                             headers=headers or None)
     if e.status_code and 400 <= e.status_code < 500:
         return JSONResponse(status_code=e.status_code, content={"error": error})
-    return JSONResponse(status_code=502, content={"error": error})
+    headers = {"Retry-After": str(e.retry_after)} if e.retry_after else None
+    return JSONResponse(status_code=503, content={"error": error},
+                        headers=headers)
 
 
 def _usage_num(result: dict, key: str) -> int:

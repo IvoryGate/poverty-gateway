@@ -2,12 +2,23 @@
 
 ## 当前进度
 
+**阶段 18 完成（mimo 上游 403 排查与校验修复）**
+> mimo 对外暴露后走网关必得上游 403 FreeTierError，真客户端直连却 200。放弃逐变量
+> 盲测，起 **relay 中间层**（真客户端 → relay(httpx) → 上游）拿到决定性 A/B：真请求 +
+> 我们的连接 → 200，证明与 TLS 指纹无关。再用真头做二分定位：①`x-opencode-request/
+> session` id 主体必须 **26 位小写 hex**（20 位 → 403，base62 → 403）；②UA `1.15.0`
+> → 426，须跟新版 `opencode/1.18.31 ... bun/1.3.14`；③body 校验 `stream=true` 且
+> `tools≥5`（403），而网关本来就是原样透传、opencode 客户端天然满足，**body 零改动**。
+> 修复仅 `zen_headers()` 两处 + context_probe 复用；端到端 `opencode → 网关 → 上游`
+> 实测 ok。同批落地 **上游错误 502→503**（保 JSON 不被中间层换 HTML）+ error type
+> 分流。70 测试 + ruff 无新增。遗留：标题生成模型 `gpt-5.4-nano` 不在映射（不致命）。
+
 **阶段 17 完成（对外模型清单更新）**
 > 对齐上游在架 14 个 free 模型，对外暴露 13 个（`mimo-v2.5` 上游 410 ModelDeprecated
 > 进默认 denylist）：代码兜底表（`DEFAULT_MODEL_MAP/LIMITS`）重填、Redis 运行时映射
 > 6 → 13、`ModelSync` 改为"上游在架即暴露"（映射先落地再探测，探测只做观测并加
 > 90s 预算）、`list_public` 对新模型不再报 context=0、代理重试耗尽的裸 `httpx`
-> 异常收口成 502。**顺带修了池子饿死的根因**：`PROBE_MODEL` 默认用的正是已 410 的
+> 异常收口成 503。**顺带修了池子饿死的根因**：`PROBE_MODEL` 默认用的正是已 410 的
 > `mimo-v2.5-free`，每个候选 IP 探测都判 DEAD、`zenhit` 全负 → 取号退化选中死 IP，
 > 换成实测 200 的 `space-bunny-free`。69 测试 + ruff 无新增问题。
 > **待人工 `sudo systemctl restart poverty-gateway` 让新 limits/denylist 生效。**
@@ -40,6 +51,7 @@
 | 14 | 池健康修复 + zen 命中筛选 | [`14-池健康修复与筛选.md`](./14-池健康修复与筛选.md) | ✅ |
 | 15 | 客户端兼容性修复 | [`15-客户端兼容性修复.md`](./15-客户端兼容性修复.md) | ✅ |
 | 17 | 对外模型清单更新 | [`17-对外模型清单更新.md`](./17-对外模型清单更新.md) | ✅ |
+| 18 | mimo 上游 403 校验修复 | [`18-上游mimo校验修复.md`](./18-上游mimo校验修复.md) | ✅ |
 
 ---
 

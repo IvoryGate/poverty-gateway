@@ -176,7 +176,7 @@ async def test_auth_valid_key_passes():
 @pytest.mark.asyncio
 async def test_upstream_4xx_passthrough_not_502():
     """response_format=json_object 被上游拒 → 网关透传 400 + 标准 error 结构，
-    不包装成 502。"""
+    不包装成网关类 5xx。"""
     from app.services.upstream import UpstreamError
 
     app = make_app(lambda r: httpx.Response(200, json={}))
@@ -228,6 +228,46 @@ async def test_upstream_429_retry_after_standard():
     assert r.headers.get("retry-after") == "17"
     body = r.json()
     assert body["error"]["type"] == "rate_limit_error"
+
+
+@pytest.mark.asyncio
+async def test_gateway_unavailable_returns_503_json():
+    """网关侧不可用（代理重试耗尽 / 上游 5xx）→ **503** + JSON error，不是 502。
+
+    502 的 body 在出网时容易被中间层替换成自己的 HTML 错误页，客户端拿不到
+    结构化 error；503 与 4xx/429 一样保留 JSON body。
+    """
+    from app.services.upstream import UpstreamError
+
+    app = make_app(lambda r: httpx.Response(200, json={}))
+    transport = httpx.ASGITransport(app=app)
+
+    async def all_dead(model, payload):
+        raise UpstreamError("all proxy retries failed: All connection attempts failed")
+
+    async def upstream_500(model, payload):
+        raise UpstreamError("upstream 500: boom", status_code=500,
+                            error_body={"message": "boom"})
+
+    payload = {"model": "deepseek-v4-flash-lite",
+               "messages": [{"role": "user", "content": "hi"}]}
+    headers = {"Authorization": "Bearer sk-alice"}
+
+    app.state.upstream.chat = all_dead        # type: ignore[method-assign]
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        r = await ac.post("/v1/chat/completions", headers=headers, json=payload)
+    assert r.status_code == 503
+    body = r.json()
+    assert "retries failed" in body["error"]["message"]
+    assert body["error"]["type"] == "upstream_error"   # 不是 invalid_request_error
+
+    app.state.upstream.chat = upstream_500    # type: ignore[method-assign]
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        r = await ac.post("/v1/chat/completions", headers=headers, json=payload)
+    assert r.status_code == 503
+    body = r.json()
+    assert body["error"]["message"] == "boom"
+    assert body["error"]["type"] == "upstream_error"
 
 
 @pytest.mark.asyncio

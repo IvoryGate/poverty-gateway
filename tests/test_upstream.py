@@ -152,7 +152,7 @@ async def test_chat_transport_errors_exhausted_become_upstream_error():
     """非流式：所有代理连接失败（重试耗尽）→ UpstreamError，不抛裸 httpx 异常。
 
     裸的 ConnectTimeout 路由层不接，会漏成 500；包成 UpstreamError(status=0)
-    后路由层按 502 + 标准 error 结构返回。
+    后路由层按 503 + 标准 error 结构返回（不用 502，避免 body 被出网中间层换掉）。
     """
     async def boom(endpoint: str, proxy: str, payload: dict):
         raise httpx.ConnectTimeout("proxy dead")
