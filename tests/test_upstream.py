@@ -148,6 +148,46 @@ async def test_chat_stream_report_dead_on_conn_error():
 
 
 @pytest.mark.asyncio
+async def test_chat_transport_errors_exhausted_become_upstream_error():
+    """非流式：所有代理连接失败（重试耗尽）→ UpstreamError，不抛裸 httpx 异常。
+
+    裸的 ConnectTimeout 路由层不接，会漏成 500；包成 UpstreamError(status=0)
+    后路由层按 502 + 标准 error 结构返回。
+    """
+    async def boom(endpoint: str, proxy: str, payload: dict):
+        raise httpx.ConnectTimeout("proxy dead")
+
+    proxies = [f"1.1.1.{i}:80" for i in range(1, 8)]   # 多于 MAX_RETRIES=5
+    client = make_client(lambda r: httpx.Response(200, json={}), proxies=proxies)
+    client._request = boom            # type: ignore[method-assign]
+
+    with pytest.raises(UpstreamError) as ei:
+        await client.chat("deepseek-v4-flash-lite",
+                          {"model": "x", "messages": []})
+    assert ei.value.status_code == 0
+    assert "retries failed" in str(ei.value)
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_transport_errors_exhausted_become_upstream_error():
+    """流式（首块前）：重试耗尽同样收口成 UpstreamError。"""
+    async def boom(endpoint: str, proxy: str, payload: dict):
+        # 分支永不成立：只为让 boom 是 async generator（同 _stream_request 形态）
+        if payload is None:
+            yield b""
+        raise httpx.ConnectTimeout("proxy dead")
+
+    proxies = [f"2.2.2.{i}:80" for i in range(1, 8)]   # 多于 MAX_RETRIES=5
+    client = make_client(lambda r: httpx.Response(200, content=b""), proxies=proxies)
+    client._stream_request = boom    # type: ignore[method-assign]
+
+    with pytest.raises(UpstreamError):
+        async for _ in client.chat_stream(
+                "deepseek-v4-flash-lite", {"model": "x"}):
+            pass
+
+
+@pytest.mark.asyncio
 async def test_circuit_breaker_trips_on_many_failures():
     """窗口内失败超阈值 → 熔断打开，后续请求快速失败。"""
     client = make_client(lambda r: httpx.Response(200, content=b""),

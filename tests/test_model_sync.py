@@ -43,9 +43,10 @@ def make_sync(model_ids, probe_results, denylist=None):
     mapper = ModelMapper(settings)
     sync = ModelSync(settings, mapper=mapper, pool=pool)
 
-    # 替换两个网络方法为 mock
+    # 替换两个网络方法为 mock。fetch 照抄真实 _fetch_free_models 的筛选
+    # （只留 id 含 "-free" 的），否则非 free 模型会被当成候选。
     async def fake_fetch() -> list[str]:
-        return list(model_ids)
+        return [m for m in model_ids if "-free" in m]
 
     async def fake_probe(model: str) -> bool:
         return probe_results.get(model, False)
@@ -59,13 +60,14 @@ def make_sync(model_ids, probe_results, denylist=None):
 async def test_sync_discovers_free_models():
     """同步发现可用 free 模型并更新映射。"""
     sync = make_sync(
-        model_ids=["deepseek-v4-flash-free", "mimo-v2.5-free", "gpt-5"],
-        probe_results={"deepseek-v4-flash-free": True, "mimo-v2.5-free": True},
+        model_ids=["deepseek-v4-flash-free", "mimo-v2.6-flash-free", "gpt-5"],
+        probe_results={"deepseek-v4-flash-free": True,
+                       "mimo-v2.6-flash-free": True},
     )
     result = await sync.sync_once()
     assert "gpt-5" not in result["available"]  # 非 free 被筛掉
     assert sync.mapper.has("deepseek-v4-flash-lite")
-    assert sync.mapper.has("mimo-v2.5-lite")
+    assert sync.mapper.has("mimo-v2.6-flash-lite")
     assert not sync.mapper.has("gpt-5")
 
 
@@ -80,6 +82,25 @@ async def test_sync_keeps_existing_on_temp_failure():
     await sync.sync_once()
     assert sync.mapper.has("deepseek-v4-flash-lite")
     assert sync.mapper.has("new-model-lite")
+
+
+@pytest.mark.asyncio
+async def test_sync_exposes_candidates_even_if_probe_fails():
+    """上游在架即暴露：探测失败的候选照样进列表，并记进 probe_failed。
+
+    代理偶发失败只影响观测，不影响对外模型清单（否则新模型因一次
+    探测失败永远进不了列表，好模型会被误摘）。
+    """
+    sync = make_sync(
+        model_ids=["deepseek-v4-flash-free", "brand-new-free"],
+        probe_results={},  # 全部探测失败
+    )
+    result = await sync.sync_once()
+    assert sync.mapper.has("deepseek-v4-flash-lite")
+    assert sync.mapper.has("brand-new-lite")
+    assert result["added"] == ["brand-new-lite"]
+    assert result["available"] == []
+    assert result["probe_failed"] == ["brand-new-lite", "deepseek-v4-flash-lite"]
 
 
 @pytest.mark.asyncio
@@ -115,6 +136,26 @@ async def test_sync_respects_denylist():
     await sync.sync_once()
     assert sync.mapper.has("good-lite")
     assert not sync.mapper.has("bad-lite")
+
+
+@pytest.mark.asyncio
+async def test_sync_excludes_default_denylist():
+    """上游在架但被默认 denylist 屏蔽的模型（如已 410 的 mimo-v2.5）不暴露。"""
+    sync = make_sync(
+        model_ids=["good-free", "mimo-v2.5-free"],
+        probe_results={"good-free": True, "mimo-v2.5-free": True},
+        denylist=Settings().model_denylist,
+    )
+    await sync.sync_once()
+    assert sync.mapper.has("good-lite")
+    assert not sync.mapper.has("mimo-v2.5-lite")
+
+
+def test_default_probe_model_is_not_deprecated():
+    """默认探测模型不能是上游已 410 的模型，否则每个 IP 都被判 DEAD。"""
+    s = Settings()
+    assert s.probe_model not in s.model_denylist
+    assert s.probe_model != "mimo-v2.5-free"
 
 
 @pytest.mark.asyncio

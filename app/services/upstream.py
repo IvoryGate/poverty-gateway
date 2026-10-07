@@ -134,7 +134,7 @@ class UpstreamClient:
                 await self.pool.report(proxy, DEAD)
                 excluded.add(proxy)
                 continue
-        raise last_err or UpstreamError("no proxy retries left")
+        raise _retries_exhausted(last_err)
 
     async def _forward_stream(self, endpoint: str, public_model: str,
                               payload: dict):
@@ -201,7 +201,7 @@ class UpstreamClient:
                     raise
                 excluded.add(proxy)
                 continue
-        raise last_err or UpstreamError("no proxy retries left")
+        raise _retries_exhausted(last_err)
 
     async def _request(self, endpoint: str, proxy: str, payload: dict) -> dict:
         url = f"{self.settings.upstream_base}/{endpoint}"
@@ -312,6 +312,19 @@ class UpstreamError(Exception):
         self.retry_after = retry_after
         self.status_code = status_code
         self.error_body = error_body or {}
+
+
+def _retries_exhausted(last_err) -> Exception:
+    """重试耗尽后的收口：传输层原始异常包成 UpstreamError（→502）。
+
+    裸的 httpx.ConnectTimeout/ConnectError 路由层不接，会漏成 500，
+    客户端看到的是网关内部错误而不是标准 502 error 结构。
+    """
+    if isinstance(last_err, UpstreamError):
+        return last_err
+    if isinstance(last_err, httpx.HTTPError):
+        return UpstreamError(f"all proxy retries failed: {last_err}")
+    return last_err or UpstreamError("no proxy retries left")
 
 
 def _parse_retry_after(r) -> int:

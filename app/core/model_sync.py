@@ -2,12 +2,12 @@
 
 - 定期（MODEL_SYNC_INTERVAL）从上游 /v1/models 拉取模型列表。
 - 筛选 free 模型（id 含 "-free"），排除配置禁用的。
-- 对候选逐个做最小 chat 探测（走代理池），只保留能出对话的。
-- 更新 ModelMapper 的对外映射（同名直出）。
-- 已下架/不可用的模型自动摘除。
+- **上游在架即对外暴露**：映射先落地再探测，探测结果只做观测
+  （available / probe_failed 日志），不参与去留判定。
+- 已下架的模型（候选列表里消失）自动摘除。
 
 注意：探测经代理池走 chat 最小请求，频率低（每个候选一次），
-避免重复占用免费额度。
+避免重复占用免费额度；探测整体有预算，超时也不影响映射更新。
 """
 
 import asyncio
@@ -31,12 +31,49 @@ class ModelSync:
         self._pool = pool  # 复用主链路 ProxyPool（含共享 store）
 
     async def sync_once(self) -> dict:
-        """执行一次同步，返回 {added: [...], removed: [...]}（对外名）。"""
+        """执行一次同步，返回 {added, removed, available, probe_failed}。"""
         candidates = await self._fetch_free_models()          # 内部 -free 名
         denied = set(self.settings.model_denylist)
         candidates = [m for m in candidates if m not in denied]
 
-        available = []
+        old = self.mapper.models()                            # {lite: free}
+        old_keys = set(old.keys())                            # lite 集合
+        cand_pub = {to_public(m) for m in candidates}          # lite 集合
+
+        if not cand_pub:
+            # 候选列表本身为空（拉取失败），保留现状
+            return {"added": [], "removed": [], "available": [],
+                    "probe_failed": []}
+
+        # 上游在架即对外暴露，**先落地映射再探测**：探测走代理池、可能慢或
+        # 卡死，不能让它挡在映射更新前面（历史上探测卡住导致新模型永远
+        # 进不了列表）。代理偶发失败也不该把上游好模型摘掉——真下架由
+        # 候选列表消失体现。
+        merged = {p: old.get(p, p.replace("-lite", "-free"))
+                  for p in cand_pub}
+        self.mapper.set_models(merged)
+
+        added = sorted(cand_pub - old_keys)
+        removed = sorted(old_keys - cand_pub)
+
+        # 探测：仅观测（available / probe_failed），带预算防卡死
+        avail_pub, probe_failed = await self._probe_all(candidates, cand_pub)
+        if probe_failed:
+            logger.warning("model probe failed (still exposed): %s",
+                           ", ".join(probe_failed))
+        return {"added": added, "removed": removed,
+                "available": sorted(avail_pub),
+                "probe_failed": probe_failed}
+
+    # 单轮探测总预算（秒）：候选可能十几个，代理不健康时单个可能拖到 20s+
+    _PROBE_BUDGET = 90
+
+    async def _probe_all(self, candidates: list[str],
+                         cand_pub: set[str]) -> tuple[set[str], list[str]]:
+        """并发探测候选，返回 (可用对外名集合, 失败对外名列表)。
+
+        超时视为全部失败——映射已在 sync_once 里落地，观测缺口不影响暴露。
+        """
         sem = asyncio.Semaphore(min(self.settings.probe_concurrency, 2))
 
         async def check(m: str) -> str | None:
@@ -45,30 +82,15 @@ class ModelSync:
                     return m
                 return None
 
-        results = await asyncio.gather(*(check(m) for m in candidates))
-        available = [m for m in results if m]                 # 内部 -free 名
-
-        old = self.mapper.models()                            # {lite: free}
-        old_keys = set(old.keys())                            # lite 集合
-        # 对外名集合：候选与可用都转成 lite
-        cand_pub = {to_public(m) for m in candidates}
-        avail_pub = {to_public(m) for m in available}
-
-        if not cand_pub:
-            # 候选列表本身为空（拉取失败），保留现状
-            return {"added": [], "removed": [], "available": []}
-
-        # 增量更新：保留"本次探测通过" + "旧映射里仍在候选但本次临时失败"的
-        # （避免一次限流把好模型全摘掉；真正下架的会从候选列表消失）
-        keep = avail_pub | (old_keys & cand_pub)
-        merged = {p: old.get(p, p.replace("-lite", "-free"))
-                  for p in keep}
-        self.mapper.set_models(merged)
-
-        added = sorted(avail_pub - old_keys)
-        removed = sorted(old_keys - cand_pub)
-        return {"added": added, "removed": removed,
-                "available": sorted(avail_pub)}
+        try:
+            results = await asyncio.wait_for(
+                asyncio.gather(*(check(m) for m in candidates)),
+                timeout=self._PROBE_BUDGET)
+        except asyncio.TimeoutError:
+            logger.warning("model probe budget %ss exceeded", self._PROBE_BUDGET)
+            return set(), sorted(cand_pub)
+        avail_pub = {to_public(m) for m in results if m}
+        return avail_pub, sorted(cand_pub - avail_pub)
 
     def _get_pool(self):
         return self._pool or ProxyPool(self.settings)

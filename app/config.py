@@ -63,8 +63,10 @@ class Settings:
         # 连通性筛选单 IP 超时（秒）：连不上的快速判定 dead，加速补池
         self.probe_timeout = self._get_float("PROBE_TIMEOUT", 5)
 
-        # 探测/冷启动使用的最小 chat 模型（能出对话即视为可用）
-        self.probe_model = self._get("PROBE_MODEL", "mimo-v2.5-free")
+        # 探测/冷启动使用的最小 chat 模型（能出对话即视为可用）。
+        # 必须用"当前稳定可用"的模型：mimo-v2.5-free 上游已 410 ModelDeprecated，
+        # 拿它探测每个 IP 都判 DEAD，zenhit 全扣成负分，取号直接饿死。
+        self.probe_model = self._get("PROBE_MODEL", "space-bunny-free")
 
         # 可用池目标规模：补池到此数即停（候选源持续增长，多 key 需更大池）
         self.pool_target = self._get_int("POOL_TARGET", 60)
@@ -103,8 +105,10 @@ class Settings:
         # 模型源同步：自动发现/摘除 free 模型（一天一次足够，上游不会频繁调整）
         self.model_sync_interval = self._get_int("MODEL_SYNC_INTERVAL", 3600)  # 秒
 
-        # 禁用模型名单（逗号分隔），自动同步时排除
-        deny = self._get("MODEL_DENYLIST", "")
+        # 禁用模型名单（逗号分隔），自动同步时排除。
+        # 默认屏蔽上游已 410 ModelDeprecated 的 mimo-v2.5-free（chat 必挂，
+        # 暴露出去只会让客户端选到坏模型）；环境变量可覆盖（传空串即全放行）。
+        deny = self._get("MODEL_DENYLIST", "mimo-v2.5-free")
         if isinstance(deny, (list, tuple)):
             self.model_denylist = [str(d) for d in deny]
         elif deny:
