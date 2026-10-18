@@ -63,6 +63,21 @@ def make_app(upstream_handler, proxies=None, api_keys=None):
 
     upstream._request = fake_request  # type: ignore[method-assign]
 
+    # 非流式 chat 现在内部走流式聚合，因此也要 mock _stream_request
+    async def fake_stream(endpoint: str, proxy: str, payload: dict):
+        r = await client.post(f"https://upstream.test/{endpoint}", json=payload)
+        if r.status_code >= 400:
+            from app.services.upstream import UpstreamError
+            raise UpstreamError(f"upstream {r.status_code}: {r.text}",
+                                status_code=r.status_code)
+        if r.content.lstrip().startswith(b"data:"):
+            yield r.content
+        else:
+            import json
+            yield ("data: " + json.dumps(r.json()) + "\n\n").encode()
+
+    upstream._stream_request = fake_stream  # type: ignore[method-assign]
+
     app = create_app(settings)
     app.state.upstream = upstream
     return app
@@ -98,7 +113,9 @@ async def test_extra_fields_passthrough():
     assert r.status_code == 200
     p = seen["payload"]
     assert p["reasoning_effort"] == "low"
-    assert p["tools"] == [{"type": "function", "function": {"name": "x"}}]
+    # 原有工具原样保留；为通过上游 free 档校验额外补了 read 占位工具
+    assert p["tools"][0] == {"type": "function", "function": {"name": "x"}}
+    assert any(t.get("function", {}).get("name") == "read" for t in p["tools"])
     assert p["tool_choice"] == "auto"
     assert p["stream_options"] == {"include_usage": True}
     # model 被替换为内部真实名（同名字符串）

@@ -60,8 +60,9 @@ class Settings:
         # 单次补池最多探测的候选数（候选可能上百个，全量探测太慢）
         self.probe_batch = self._get_int("PROBE_BATCH", 60)
 
-        # 连通性筛选单 IP 超时（秒）：连不上的快速判定 dead，加速补池
-        self.probe_timeout = self._get_float("PROBE_TIMEOUT", 5)
+        # 连通性筛选单 IP 超时（秒）：连不上的快速判定 dead，加速补池。
+        # 免费代理质量参差，5s 会误杀响应偏慢但能用的 IP；8s 兼顾成功率与冷启动。
+        self.probe_timeout = self._get_float("PROBE_TIMEOUT", 8)
 
         # 探测/冷启动使用的最小 chat 模型（能出对话即视为可用）。
         # 必须用"当前稳定可用"的模型：mimo-v2.5-free 上游已 410 ModelDeprecated，

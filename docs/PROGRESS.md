@@ -2,6 +2,17 @@
 
 ## 当前进度
 
+**阶段 19 完成（free 档校验再次变更：请求头 + body 形状 + 探测）**
+> 2026-10-14 上游再换 free 档校验，线上全模型 403、池子显示 empty、模型探测
+> 全灭。按真实 opencode 1.18.31 抓包 + opencode2api 实现对齐：session 改回
+> canonical 降序 id、request 改 `msg_`+时间戳+Base62、项目固定 `global`、
+> 去掉 `x-api-key`、补 `x-opencode-session-id`。更关键的是**探测请求也不再
+> 裸 chat**：新增 `probe_payload()`（stream=true + read 工具），代理探测和
+> 模型探测共用，池子饿死根因消除。非流式 chat 改为内部流式 + SSE 聚合；
+> 4xx 不再误伤代理。79 测试通过，本地灰度流式/非流式实测 200。
+> **待人工 `sudo systemctl restart poverty-gateway`，清旧 pool_snapshot 后
+> 用真实请求慢慢触发补池。**
+
 **阶段 18 完成（mimo 上游 403 排查与校验修复）**
 > mimo 对外暴露后走网关必得上游 403 FreeTierError，真客户端直连却 200。放弃逐变量
 > 盲测，起 **relay 中间层**（真客户端 → relay(httpx) → 上游）拿到决定性 A/B：真请求 +
@@ -52,6 +63,7 @@
 | 15 | 客户端兼容性修复 | [`15-客户端兼容性修复.md`](./15-客户端兼容性修复.md) | ✅ |
 | 17 | 对外模型清单更新 | [`17-对外模型清单更新.md`](./17-对外模型清单更新.md) | ✅ |
 | 18 | mimo 上游 403 校验修复 | [`18-上游mimo校验修复.md`](./18-上游mimo校验修复.md) | ✅ |
+| 19 | free 档校验变更 + 探测修复 | [`19-freetier校验与请求头修复.md`](./19-freetier校验与请求头修复.md) | ✅ |
 
 ---
 

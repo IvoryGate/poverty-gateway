@@ -52,11 +52,16 @@ class UpstreamClient:
     async def chat(self, public_model: str, payload: dict):
         """转发一次 chat completion（非流式）。
 
-        public_model: 对外模型名。
-        payload: 客户端传来的完整 body（model 会被替换为真实名）。
+        上游 free 档 2026-10-14 起只接受 ``stream=true`` + read 工具的
+        agent 形状，因此这里强制走上游流式，再把 SSE 聚合成标准
+        ``chat.completion`` JSON 返回给客户端。
         """
-        return await self._forward(
-            "chat/completions", public_model, payload, force_stream=False)
+        payload = _ensure_read_tool(payload, "chat/completions")
+        collector = _ChatStreamCollector(public_model)
+        async for chunk in self._forward_stream(
+                "chat/completions", public_model, payload):
+            collector.feed(chunk)
+        return collector.result()
 
     async def chat_stream(self, public_model: str, payload: dict):
         """转发一次 chat completion（流式 SSE），逐块产出原始字节。
@@ -96,6 +101,7 @@ class UpstreamClient:
         payload["model"] = upstream_model
         if endpoint == "chat/completions":
             payload = _normalize_chat_payload(payload)
+        payload = _ensure_read_tool(payload, endpoint)
 
         last_err = None
         excluded: set[str] = set()
@@ -112,14 +118,22 @@ class UpstreamClient:
             except UpstreamError as e:
                 last_err = e
                 self.pool.note_error(_classify(e.status_code))
-                if "429" not in str(e) and not str(e).startswith("upstream 5"):
-                    # 非限流且非上游 5xx（如 4xx 参数问题）重试无意义
-                    await self.pool.report(proxy, COOLDOWN, cooldown_seconds=e.retry_after)
-                    raise
-                self._register_failure()
-                await self.pool.report(proxy, COOLDOWN, cooldown_seconds=e.retry_after)
-                excluded.add(proxy)
-                continue
+                if e.status_code == 429 or 500 <= e.status_code < 600:
+                    # 限流 / 上游 5xx：换代理重试
+                    self._register_failure()
+                    await self.pool.report(
+                        proxy, COOLDOWN, cooldown_seconds=e.retry_after)
+                    excluded.add(proxy)
+                    continue
+                if _is_abuse(e):
+                    # 上游按 IP 判定滥用：这个 IP 对 free 档不可用，换下一个
+                    await self.pool.report(proxy, DEAD)
+                    excluded.add(proxy)
+                    continue
+                # 其余 4xx（参数/模型不支持/形状校验）是请求本身的问题，
+                # 重试和惩罚代理都无意义：仅归还 in-flight，原样抛给客户端。
+                self.pool.release(proxy)
+                raise
             except httpx.TimeoutException as e:
                 # 传输超时：代理慢/挂，剔除换一个（记入 timeout 桶）
                 last_err = e
@@ -148,6 +162,7 @@ class UpstreamClient:
         payload["stream"] = True
         if endpoint == "chat/completions":
             payload = _normalize_chat_payload(payload)
+        payload = _ensure_read_tool(payload, endpoint)
 
         last_err = None
         excluded: set[str] = set()
@@ -178,13 +193,19 @@ class UpstreamClient:
                     # 已在出流中途失败：无法重试，标记状态后抛
                     await self.pool.report(proxy, COOLDOWN, cooldown_seconds=e.retry_after)
                     raise
-                if "429" not in str(e) and not str(e).startswith("upstream 5"):
-                    await self.pool.report(proxy, COOLDOWN, cooldown_seconds=e.retry_after)
-                    raise
-                self._register_failure()
-                await self.pool.report(proxy, COOLDOWN, cooldown_seconds=e.retry_after)
-                excluded.add(proxy)
-                continue
+                if e.status_code == 429 or 500 <= e.status_code < 600:
+                    self._register_failure()
+                    await self.pool.report(
+                        proxy, COOLDOWN, cooldown_seconds=e.retry_after)
+                    excluded.add(proxy)
+                    continue
+                if _is_abuse(e):
+                    await self.pool.report(proxy, DEAD)
+                    excluded.add(proxy)
+                    continue
+                # 其余 4xx 是请求本身的问题，不惩罚代理
+                self.pool.release(proxy)
+                raise
             except httpx.TimeoutException as e:
                 last_err = e
                 self.pool.note_error("timeout")
@@ -211,7 +232,7 @@ class UpstreamClient:
             timeout=timeout, proxy=proxy_url
         ) as client:
             r = await client.post(
-                url, headers=zen_headers(), json=payload
+                url, headers=zen_headers(_conversation_seed(payload)), json=payload
             )
         if r.status_code >= 400:
             detail = r.text[:500]
@@ -231,7 +252,8 @@ class UpstreamClient:
         async with httpx.AsyncClient(
             timeout=timeout, proxy=proxy_url
         ) as client, client.stream(
-            "POST", url, headers=zen_headers(), json=payload
+            "POST", url, headers=zen_headers(_conversation_seed(payload)),
+            json=payload
         ) as r:
             if r.status_code >= 400:
                 body = await r.aread()
@@ -258,7 +280,8 @@ class UpstreamClient:
         async with httpx.AsyncClient(
             timeout=timeout, proxy=proxy_url
         ) as client, client.stream(
-            "POST", url, headers=zen_headers(), json=payload
+            "POST", url, headers=zen_headers(_conversation_seed(payload)),
+            json=payload
         ) as r:
             if r.status_code >= 400:
                 body = await r.aread()
@@ -359,6 +382,204 @@ def _parse_error_body(r) -> dict:
     return {}
 
 
+def _conversation_seed(payload: dict) -> str | None:
+    """从请求体取会话种子：首条 user 消息（多轮历史增长时保持同一 session）。
+
+    上游按 session 做 prompt cache 亲和；每轮随机 session 会让缓存全部失效。
+    Responses 的 input 既可能是字符串，也可能是 item 列表。
+    """
+    input_value = payload.get("input")
+    if isinstance(input_value, str) and input_value.strip():
+        return input_value
+    for field in ("messages", "input"):
+        items = payload.get(field)
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            role = item.get("role")
+            if role not in (None, "user"):
+                continue
+            content = item.get("content")
+            if isinstance(content, str) and content:
+                return content
+            if content is not None:
+                try:
+                    return json.dumps(content, ensure_ascii=False, sort_keys=True)
+                except (TypeError, ValueError):
+                    continue
+    return None
+
+
+# 上游 free 档要求请求里出现名为 read 的工具（legacy /zen/v1 只校验名字）。
+# 客户端没带时补一个"已废弃、不要调用"的占位工具，避免改变模型行为。
+_DEPRECATED_READ_DESCRIPTION = (
+    "DEPRECATED: This tool is deprecated and disabled. "
+    "Do NOT call or reference this tool under any circumstances; ignore it completely."
+)
+
+
+def _read_tool(endpoint: str) -> dict:
+    if endpoint == "responses":
+        return {
+            "type": "function",
+            "name": "read",
+            "description": _DEPRECATED_READ_DESCRIPTION,
+            "parameters": {"type": "object", "properties": {}},
+        }
+    return {
+        "type": "function",
+        "function": {
+            "name": "read",
+            "description": _DEPRECATED_READ_DESCRIPTION,
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }
+
+
+def _tool_name(tool, endpoint: str) -> str:
+    if not isinstance(tool, dict):
+        return ""
+    if endpoint == "responses":
+        name = tool.get("name")
+    else:
+        fn = tool.get("function")
+        name = fn.get("name") if isinstance(fn, dict) else None
+    return name if isinstance(name, str) else ""
+
+
+def _ensure_read_tool(payload: dict, endpoint: str) -> dict:
+    """保证请求带 read 工具；已带则原样返回。"""
+    tools = payload.get("tools")
+    if isinstance(tools, list):
+        if any(_tool_name(t, endpoint) == "read" for t in tools):
+            return payload
+        return dict(payload, tools=[*tools, _read_tool(endpoint)])
+    return dict(payload, tools=[_read_tool(endpoint)])
+
+
+class _ChatStreamCollector:
+    """把上游 chat SSE 聚合成一个非流式 ``chat.completion`` 对象。"""
+
+    def __init__(self, public_model: str):
+        self.public_model = public_model
+        self.buf = ""
+        self.id = ""
+        self.created = 0
+        self.content: list[str] = []
+        self.reasoning: list[str] = []
+        self.tool_calls: dict[int, dict] = {}
+        self.finish_reason = None
+        self.usage = None
+
+    def feed(self, chunk: bytes):
+        """喂入原始 SSE 字节，按空行切帧（兼容 \\r\\n）。"""
+        self.buf += chunk.decode("utf-8", errors="replace")
+        self.buf = self.buf.replace("\r\n", "\n")
+        while "\n\n" in self.buf:
+            frame, self.buf = self.buf.split("\n\n", 1)
+            self._handle_frame(frame)
+
+    def _handle_frame(self, frame: str):
+        for line in frame.splitlines():
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if not data or data == "[DONE]":
+                continue
+            try:
+                obj = json.loads(data)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            if obj.get("id"):
+                self.id = obj["id"]
+            if obj.get("created"):
+                self.created = obj["created"]
+            if isinstance(obj.get("usage"), dict) and obj["usage"]:
+                self.usage = obj["usage"]
+            choices = obj.get("choices")
+            if not isinstance(choices, list) or not choices:
+                continue
+            choice = choices[0]
+            if not isinstance(choice, dict):
+                continue
+            if choice.get("finish_reason"):
+                self.finish_reason = choice["finish_reason"]
+            message = choice.get("message")
+            if isinstance(message, dict):
+                # 上游若直接返回整段 message（测试/非标准流），按完整消息收下
+                if isinstance(message.get("content"), str):
+                    self.content.append(message["content"])
+                if isinstance(message.get("reasoning_content"), str):
+                    self.reasoning.append(message["reasoning_content"])
+                for call in message.get("tool_calls") or []:
+                    if isinstance(call, dict):
+                        index = len(self.tool_calls)
+                        self.tool_calls[index] = {
+                            "id": call.get("id", ""),
+                            "type": call.get("type", "function"),
+                            "function": dict(call.get("function") or {
+                                "name": "", "arguments": ""}),
+                        }
+            delta = choice.get("delta")
+            if not isinstance(delta, dict):
+                continue
+            if isinstance(delta.get("content"), str):
+                self.content.append(delta["content"])
+            if isinstance(delta.get("reasoning_content"), str):
+                self.reasoning.append(delta["reasoning_content"])
+            for call in delta.get("tool_calls") or []:
+                if not isinstance(call, dict):
+                    continue
+                index = call.get("index", 0)
+                if not isinstance(index, int):
+                    index = 0
+                slot = self.tool_calls.setdefault(
+                    index, {"id": "", "type": "function",
+                            "function": {"name": "", "arguments": ""}})
+                if call.get("id"):
+                    slot["id"] = call["id"]
+                if call.get("type"):
+                    slot["type"] = call["type"]
+                fn = call.get("function")
+                if isinstance(fn, dict):
+                    if fn.get("name"):
+                        slot["function"]["name"] += fn["name"]
+                    if fn.get("arguments"):
+                        slot["function"]["arguments"] += fn["arguments"]
+
+    def result(self) -> dict:
+        message = {"role": "assistant"}
+        text = "".join(self.content)
+        if self.tool_calls:
+            message["tool_calls"] = [
+                {k: v for k, v in self.tool_calls[i].items() if k != "index"}
+                for i in sorted(self.tool_calls)
+            ]
+            message["content"] = text or None
+            finish = self.finish_reason or "tool_calls"
+        else:
+            message["content"] = text
+            finish = self.finish_reason or "stop"
+        reasoning = "".join(self.reasoning)
+        if reasoning:
+            message["reasoning_content"] = reasoning
+        result = {
+            "id": self.id or "chatcmpl",
+            "object": "chat.completion",
+            "created": self.created or int(time.time()),
+            "model": self.public_model,
+            "choices": [{"index": 0, "message": message,
+                         "finish_reason": finish}],
+        }
+        if self.usage:
+            result["usage"] = self.usage
+        return result
+
+
 def _normalize_chat_payload(payload: dict) -> dict:
     """归一化 chat 请求里的 assistant 消息，规避上游 reasoning_content 校验。
 
@@ -389,6 +610,20 @@ def _classify(status_code: int) -> str:
     if 500 <= status_code < 600:
         return "5xx"
     return "4xx"
+
+
+def _is_abuse(e: "UpstreamError") -> bool:
+    """上游 403 的 message 是否为 IP 滥用判定（该代理不可用）。
+
+    与"请求形状不对"（free tier can only be used from within OpenCode）
+    区分开：后者是我们自己的头/body 问题，换代理也没用，不应把 IP 拉黑。
+    """
+    if e.status_code != 403:
+        return False
+    message = ""
+    if isinstance(e.error_body, dict):
+        message = str(e.error_body.get("message") or "")
+    return "Detect Abuse Traffic" in (message or str(e))
 
 
 def _sanitize_responses(payload: dict) -> dict:

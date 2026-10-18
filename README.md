@@ -45,7 +45,7 @@ pip install -r requirements.txt
 | `PROXY_POOL_URL` | `http://127.0.0.1:5010` | proxy-pool API |
 | `POOL_TARGET` / `POOL_LOW_WATER` | 60 / 40 | 池水位 |
 | `PROBE_CONCURRENCY` | 8 | 候选探测并发 |
-| `PROBE_MODEL` | `deepseek-v4-flash-free` | 探测用上游模型 |
+| `PROBE_MODEL` | `space-bunny-free` | 探测用上游模型 |
 
 ## API
 
@@ -59,7 +59,7 @@ pip install -r requirements.txt
 ## 测试
 
 ```bash
-.venv/bin/python -m pytest      # 59 passed
+.venv/bin/python -m pytest      # 79 passed
 .venv/bin/ruff check .          # All checks passed
 ```
 

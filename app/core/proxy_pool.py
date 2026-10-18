@@ -20,7 +20,7 @@ import logging
 import httpx
 
 from app.config import Settings
-from app.core.headers import zen_headers
+from app.core.headers import probe_payload, zen_headers
 from app.core.redis_store import RedisStore
 
 logger = logging.getLogger(__name__)
@@ -511,9 +511,14 @@ class ProxyPool:
     async def _probe(self, proxy: str) -> str:
         """单个 IP 的最小 chat 探测：能出对话才算可用。
 
-        探测请求用最小 token 的 chat（max_tokens=1），只求拿到 200。
+        探测必须伪装成 opencode 的 agent 请求（stream=true + read 工具），
+        否则 2026-10-14 起上游对所有 free 模型返回 403 FreeTierError，
+        所有候选 IP 都会被误判成 DEAD（阶段 19 的池子饿死根因）。
+        只用 max_tokens=1，拿到响应头即可，不读完整输出。
+
         429 → 限流（COOLDOWN），并把 retry-after 记录到 _probe_retry；
-        连不上/其他 → DEAD。
+        连不上/其他 → DEAD；403 若是"请求形状不对"而非 IP 滥用，记日志，
+        方便下次上游改校验时第一时间发现。
         探测同时记录耗时到 EWMA 延迟表，冷启动时就有延迟排序依据，
         无需额外请求。
         注：httpx 0.28 代理参数在 client 构造时传，每 IP 独立 client。
@@ -521,28 +526,38 @@ class ProxyPool:
         import time
         url = f"{self.settings.upstream_base}/chat/completions"
         proxy_url = f"http://{proxy}"
-        body = {
-            "model": self.settings.probe_model,
-            "messages": [{"role": "user", "content": "hi"}],
-            "max_tokens": 1,
-        }
+        body = probe_payload(self.settings.probe_model)
         t0 = time.monotonic()
+        retry_after = 0
+        status = 0
         try:
             async with httpx.AsyncClient(
-                proxy=proxy_url, timeout=self.settings.probe_timeout
-            ) as client:
-                r = await client.post(url, headers=zen_headers(), json=body)
+                proxy=proxy_url, timeout=self.settings.probe_timeout,
+                follow_redirects=False,
+            ) as client, client.stream(
+                "POST", url, headers=zen_headers(), json=body,
+            ) as r:
+                status = r.status_code
+                if status == 429:
+                    try:
+                        retry_after = max(int(
+                            r.headers.get("retry-after", "0") or 0), 0)
+                    except (TypeError, ValueError):
+                        retry_after = 0
+                elif status == 403:
+                    raw = await r.aread()
+                    detail = raw[:300].decode("utf-8", errors="replace")
+                    if "Detect Abuse Traffic" not in detail:
+                        logger.warning(
+                            "探测被上游形状校验拒绝（请求头/body 可能又变了）:"
+                            " %s", detail)
         except httpx.HTTPError:
             return DEAD
         elapsed_ms = round((time.monotonic() - t0) * 1000, 1)
-        if r.status_code == 200:
+        if status == 200:
             self._update_latency(proxy, elapsed_ms)
             return OK
-        if r.status_code == 429:
-            try:
-                self._probe_retry[proxy] = max(int(
-                    r.headers.get("retry-after", "0") or 0), 0)
-            except (TypeError, ValueError):
-                self._probe_retry[proxy] = 0
+        if status == 429:
+            self._probe_retry[proxy] = retry_after
             return COOLDOWN
         return DEAD

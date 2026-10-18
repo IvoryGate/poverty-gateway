@@ -16,7 +16,7 @@ import logging
 import httpx
 
 from app.config import Settings
-from app.core.headers import zen_headers
+from app.core.headers import probe_payload, zen_headers
 from app.core.model_map import ModelMapper, to_public
 from app.core.proxy_pool import NoProxyAvailable, ProxyPool
 
@@ -127,11 +127,7 @@ class ModelSync:
         except (NoProxyAvailable, asyncio.TimeoutError):
             return False
         url = f"{self.settings.upstream_base}/chat/completions"
-        body = {
-            "model": model,
-            "messages": [{"role": "user", "content": "hi"}],
-            "max_tokens": 1,
-        }
+        body = probe_payload(model)
         try:
             async with httpx.AsyncClient(
                 proxy=f"http://{proxy}", timeout=self.settings.probe_timeout

@@ -52,7 +52,8 @@ def make_client(upstream_handler, proxy_probes="ok", proxies=None):
     async def _fake_stream(endpoint: str, proxy: str, payload: dict):
         r = upstream_handler(httpx.Request("POST", "https://upstream.test"))
         if r.status_code >= 400:
-            raise UpstreamError(f"upstream {r.status_code}: {r.text[:200]}")
+            raise UpstreamError(f"upstream {r.status_code}: {r.text[:200]}",
+                                status_code=r.status_code)
         for block in r.content.split(b"\n\n"):
             if block:
                 yield block + b"\n\n"
@@ -114,6 +115,32 @@ async def test_chat_stream_4xx_no_retry():
             "deepseek-v4-flash-lite", {"model": "x"}):
             pass
     assert calls["n"] == 1
+    # 4xx 是请求本身的问题，不能把代理拉进冷却/剔除
+    assert "1.1.1.1:80" in client.pool._available
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_abuse_403_rotates_proxy():
+    """403 Detect Abuse Traffic 是 IP 问题：剔除该 IP 并换下一个。"""
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(403, json={
+                "type": "error",
+                "error": {"type": "FreeTierError",
+                          "message": "Forbidden, OpenCode Free Model Gateway "
+                                     "Detect Abuse Traffic"},
+            })
+        return httpx.Response(200, content=b"data: [DONE]\n\n")
+
+    client = make_client(handler, proxies=["1.1.1.1:80", "2.2.2.2:80"])
+    chunks = [c async for c in client.chat_stream(
+        "deepseek-v4-flash-lite", {"model": "x"})]
+    assert calls["n"] == 2
+    assert chunks == [b"data: [DONE]\n\n"]
+    assert "1.1.1.1:80" not in client.pool._available
 
 
 @pytest.mark.asyncio
@@ -156,10 +183,11 @@ async def test_chat_transport_errors_exhausted_become_upstream_error():
     """
     async def boom(endpoint: str, proxy: str, payload: dict):
         raise httpx.ConnectTimeout("proxy dead")
+        yield  # pragma: no cover - 让函数成为异步生成器
 
     proxies = [f"1.1.1.{i}:80" for i in range(1, 8)]   # 多于 MAX_RETRIES=5
     client = make_client(lambda r: httpx.Response(200, json={}), proxies=proxies)
-    client._request = boom            # type: ignore[method-assign]
+    client._stream_request = boom            # type: ignore[method-assign]
 
     with pytest.raises(UpstreamError) as ei:
         await client.chat("deepseek-v4-flash-lite",
@@ -344,3 +372,63 @@ async def test_note_error_ignores_unknown_kind():
     pool.note_error("mystery_kind")
     m = pool.metrics()
     assert m["errors"] == {"429": 0, "5xx": 0, "4xx": 0, "timeout": 0, "conn": 0}
+
+
+def test_ensure_read_tool_appends_and_is_idempotent():
+    """free 档要求 read 工具：缺失时补占位，已有则不动。"""
+    from app.services.upstream import _ensure_read_tool
+
+    raw = {"tools": [{"type": "function", "function": {"name": "x"}}]}
+    out = _ensure_read_tool(raw, "chat/completions")
+    names = [t["function"]["name"] for t in out["tools"]]
+    assert names == ["x", "read"]
+    assert raw["tools"] == [{"type": "function", "function": {"name": "x"}}]
+
+    again = _ensure_read_tool(out, "chat/completions")
+    assert [t["function"]["name"] for t in again["tools"]] == ["x", "read"]
+
+    responses = _ensure_read_tool({"tools": []}, "responses")
+    assert responses["tools"][0]["name"] == "read"
+
+
+def test_chat_stream_collector_aggregates_sse():
+    """非流式 chat 聚合：content/reasoning/tool_calls/usage 都不丢。"""
+    from app.services.upstream import _ChatStreamCollector
+
+    chunks = [
+        b'data: {"id":"c1","created":1,"choices":[{"delta":{"role":"assistant","reasoning_content":"think"}}]}\n\n',
+        b'data: {"choices":[{"delta":{"content":"hello "}}]}\n\n',
+        (b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"t1","type":"function",'
+         b'"function":{"name":"read","arguments":"{\\"pa"}}]}}]}\n\n'),
+        (b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,'
+         b'"function":{"arguments":"th\\":\\"x\\"}"}}]},"finish_reason":"tool_calls"}]}\n\n'),
+        b'data: {"usage":{"prompt_tokens":10,"completion_tokens":2}}\n\n',
+        b'data: [DONE]\n\n',
+    ]
+    c = _ChatStreamCollector("space-bunny-lite")
+    for chunk in chunks:
+        c.feed(chunk)
+    out = c.result()
+    assert out["id"] == "c1"
+    assert out["model"] == "space-bunny-lite"
+    msg = out["choices"][0]["message"]
+    assert msg["content"] == "hello "
+    assert msg["reasoning_content"] == "think"
+    assert msg["tool_calls"][0]["function"] == {
+        "name": "read", "arguments": '{"path":"x"}'}
+    assert out["usage"]["prompt_tokens"] == 10
+    assert out["choices"][0]["finish_reason"] == "tool_calls"
+
+
+def test_conversation_seed_stable_across_turns():
+    """会话种子取首条 user 消息，多轮追加历史不影响 session 稳定性。"""
+    from app.services.upstream import _conversation_seed
+
+    first = {"messages": [{"role": "user", "content": "hello"}]}
+    later = {"messages": [
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "hi"},
+        {"role": "user", "content": "again"},
+    ]}
+    assert _conversation_seed(first) == _conversation_seed(later) == "hello"
+    assert _conversation_seed({"input": "prompt"}) == "prompt"
