@@ -6,10 +6,11 @@
 > 本地 opencode 请求一直无响应、面板长期显示在途。根因不是没代理，而是：
 > ①httpx 读超时 300s，坏代理「连得上但不吐字」会把请求挂 5 分钟，重试 5 次
 > 更久；②请求只在首字节到达时才上报 OK/归还 in-flight，客户端在首字节前
-> 断开时 GeneratingExit 不走普通 except，in-flight 永久泄漏；③health 探活
-> 15s 也会看起来挂住。修复：首字节 15s 超时（`FIRST_EVENT_TIMEOUT`）后换
-> 代理；`_forward_stream` 每个 attempt 用 `finally` 兜底归还 in-flight；
-> health 探活超时收到 5/8s。80 测试通过。**待重启网关生效。**
+> 断开时 GeneratorExit 不走普通 except，in-flight 永久泄漏；③health 探活
+> 15s 也会看起来挂住。修复：首字节超时按请求体大小自适应（15/90/240s，
+> `FIRST_EVENT_TIMEOUT*`）+ 总预算 300s；`_forward_stream` 每个 attempt 用
+> `finally` 兜底归还 in-flight；health 探活超时收到 5/8s；重试 5→3。
+> 81 测试通过。**待重启网关生效。**
 
 **阶段 19 完成（free 档校验再次变更：请求头 + body 形状 + 探测）**
 > 2026-10-14 上游再换 free 档校验，线上全模型 403、池子显示 empty、模型探测

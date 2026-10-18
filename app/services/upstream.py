@@ -22,10 +22,31 @@ from app.core.proxy_pool import (
 )
 from app.core.redis_store import RedisStore
 
-MAX_RETRIES = 5
+MAX_RETRIES = 3
 
 _CB_FAIL = "cb:fail:"    # 失败计数窗口桶
 _CB_OPEN = "cb:open"     # 熔断开关
+
+
+def _first_event_timeout(settings, payload: dict) -> float:
+    """按请求体大小选择首字节超时。
+
+    小请求 15s 足够识别"连上但不吐字"的坏代理；opencode 带完整历史/工具时
+    请求体可达几百 KB，上游 prefill 本身就要 30~120s，必须放宽，否则会把
+    正常请求误杀成"首字节超时"并反复重试。
+    """
+    base = settings.first_event_timeout
+    if base <= 0:
+        return 0
+    try:
+        size = len(json.dumps(payload, ensure_ascii=False))
+    except (TypeError, ValueError):
+        size = 0
+    if size >= 300_000:
+        return max(base, settings.first_event_timeout_large)
+    if size >= 80_000:
+        return max(base, settings.first_event_timeout_medium)
+    return base
 
 
 class UpstreamClient:
@@ -168,7 +189,16 @@ class UpstreamClient:
 
         last_err = None
         excluded: set[str] = set()
+        first_timeout = _first_event_timeout(self.settings, payload)
+        request_start = time.monotonic()
         for attempt in range(MAX_RETRIES):
+            remaining = (self.settings.request_deadline
+                         - (time.monotonic() - request_start))
+            if remaining <= 0:
+                last_err = last_err or UpstreamError("request deadline exceeded")
+                break
+            attempt_timeout = (
+                min(first_timeout, remaining) if first_timeout > 0 else 0)
             proxy = await self.pool.get_proxy(exclude=excluded)
             started = False
             reported = False
@@ -183,10 +213,10 @@ class UpstreamClient:
                 it = gen.__aiter__()
                 while True:
                     try:
-                        if not started and self.settings.first_event_timeout > 0:
+                        if not started and attempt_timeout > 0:
                             chunk = await asyncio.wait_for(
                                 it.__anext__(),
-                                timeout=self.settings.first_event_timeout)
+                                timeout=attempt_timeout)
                         else:
                             chunk = await it.__anext__()
                     except StopAsyncIteration:
@@ -205,8 +235,7 @@ class UpstreamClient:
             except asyncio.TimeoutError:
                 # 连上了但迟迟不吐首字节：换代理，别让请求挂 300s
                 last_err = UpstreamError(
-                    f"upstream first event timeout "
-                    f"({self.settings.first_event_timeout}s)")
+                    f"upstream first event timeout ({attempt_timeout:g}s)")
                 self.pool.note_error("timeout")
                 if gen is not None:
                     with contextlib.suppress(Exception):

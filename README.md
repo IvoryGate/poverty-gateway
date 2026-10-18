@@ -47,6 +47,9 @@ pip install -r requirements.txt
 | `PROBE_CONCURRENCY` | 8 | 候选探测并发 |
 | `PROBE_MODEL` | `space-bunny-free` | 探测用上游模型 |
 | `FIRST_EVENT_TIMEOUT` | 15 | 首字节超时（秒），超时换代理；0 关闭 |
+| `FIRST_EVENT_TIMEOUT_MEDIUM` | 90 | 请求体 ≥80KB 时的首字节超时 |
+| `FIRST_EVENT_TIMEOUT_LARGE` | 240 | 请求体 ≥300KB 时的首字节超时 |
+| `REQUEST_DEADLINE` | 300 | 单次请求总预算（秒） |
 
 ## API
 
@@ -60,7 +63,7 @@ pip install -r requirements.txt
 ## 测试
 
 ```bash
-.venv/bin/python -m pytest      # 80 passed
+.venv/bin/python -m pytest      # 81 passed
 .venv/bin/ruff check .          # All checks passed
 ```
 

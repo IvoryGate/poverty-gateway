@@ -82,7 +82,16 @@ class Settings:
         # 首字节超时（秒）：免费代理可能"连得上但永远不返回数据"，若沿用
         # httpx 的 read=300s，一个坏代理就能把请求挂 5 分钟（重试 5 次更久），
         # 面板上表现为 in-flight 长期不动。首字节超时后换下一个代理。
+        # 注意：大上下文（opencode 带完整历史/工具）上游 prefill 本身就要
+        # 30~120s 才吐首字节，所以按请求体大小自适应放宽。
         self.first_event_timeout = self._get_float("FIRST_EVENT_TIMEOUT", 15)
+        self.first_event_timeout_medium = self._get_float(
+            "FIRST_EVENT_TIMEOUT_MEDIUM", 90)
+        self.first_event_timeout_large = self._get_float(
+            "FIRST_EVENT_TIMEOUT_LARGE", 240)
+        # 单次请求总预算（秒）：限制坏代理 + 重试的累计等待，避免客户端
+        # 无限期挂起。首字节等待会被压到不超过剩余预算。
+        self.request_deadline = self._get_float("REQUEST_DEADLINE", 300)
 
         # API-Key 鉴权：是否启用（默认启用；测试可关）
         self.auth_enabled = self._get_bool("AUTH_ENABLED", True)

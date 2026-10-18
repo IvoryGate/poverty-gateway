@@ -455,3 +455,21 @@ def test_conversation_seed_stable_across_turns():
     ]}
     assert _conversation_seed(first) == _conversation_seed(later) == "hello"
     assert _conversation_seed({"input": "prompt"}) == "prompt"
+
+
+def test_first_event_timeout_scales_with_body_size():
+    """大上下文 prefill 慢：首字节超时按请求体大小放宽，避免误杀。"""
+    from app.services.upstream import _first_event_timeout
+
+    s = Settings(
+        first_event_timeout=15,
+        first_event_timeout_medium=90,
+        first_event_timeout_large=240,
+    )
+    small = {"messages": [{"role": "user", "content": "hi"}]}
+    medium = {"messages": [{"role": "user", "content": "x" * 100_000}]}
+    large = {"messages": [{"role": "user", "content": "x" * 400_000}]}
+    assert _first_event_timeout(s, small) == 15
+    assert _first_event_timeout(s, medium) == 90
+    assert _first_event_timeout(s, large) == 240
+    assert _first_event_timeout(Settings(first_event_timeout=0), small) == 0
