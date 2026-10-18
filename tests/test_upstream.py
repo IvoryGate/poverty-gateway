@@ -3,6 +3,8 @@
 用 httpx.MockTransport 模拟上游 zen 与代理池探测，不依赖真实服务。
 """
 
+import asyncio
+
 import httpx
 import pytest
 
@@ -94,6 +96,27 @@ async def test_chat_stream_retry_on_429():
         return httpx.Response(200, content=b"data: [DONE]\n\n")
 
     client = make_client(handler, proxies=["1.1.1.1:80", "2.2.2.2:80"])
+    chunks = [c async for c in client.chat_stream(
+        "deepseek-v4-flash-lite", {"model": "x"})]
+    assert calls["n"] == 2
+    assert chunks == [b"data: [DONE]\n\n"]
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_first_event_timeout_rotates():
+    """代理连上但不吐首字节：首字节超时后换下一个，别挂 300s。"""
+    calls = {"n": 0}
+
+    async def slow_stream(endpoint: str, proxy: str, payload: dict):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            await asyncio.sleep(0.3)
+        yield b"data: [DONE]\n\n"
+
+    client = make_client(lambda r: httpx.Response(200), proxies=["1.1.1.1:80", "2.2.2.2:80"])
+    client._stream_request = slow_stream  # type: ignore[method-assign]
+    client.settings.first_event_timeout = 0.05
+
     chunks = [c async for c in client.chat_stream(
         "deepseek-v4-flash-lite", {"model": "x"})]
     assert calls["n"] == 2

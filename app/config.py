@@ -79,6 +79,11 @@ class Settings:
         # 单个 IP 最大在途并发：超过则取号时跳过，避免同 IP 被打爆
         self.max_in_flight = self._get_int("MAX_IN_FLIGHT", 5)
 
+        # 首字节超时（秒）：免费代理可能"连得上但永远不返回数据"，若沿用
+        # httpx 的 read=300s，一个坏代理就能把请求挂 5 分钟（重试 5 次更久），
+        # 面板上表现为 in-flight 长期不动。首字节超时后换下一个代理。
+        self.first_event_timeout = self._get_float("FIRST_EVENT_TIMEOUT", 15)
+
         # API-Key 鉴权：是否启用（默认启用；测试可关）
         self.auth_enabled = self._get_bool("AUTH_ENABLED", True)
 

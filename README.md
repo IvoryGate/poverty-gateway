@@ -46,6 +46,7 @@ pip install -r requirements.txt
 | `POOL_TARGET` / `POOL_LOW_WATER` | 60 / 40 | 池水位 |
 | `PROBE_CONCURRENCY` | 8 | 候选探测并发 |
 | `PROBE_MODEL` | `space-bunny-free` | 探测用上游模型 |
+| `FIRST_EVENT_TIMEOUT` | 15 | 首字节超时（秒），超时换代理；0 关闭 |
 
 ## API
 
@@ -59,7 +60,7 @@ pip install -r requirements.txt
 ## 测试
 
 ```bash
-.venv/bin/python -m pytest      # 79 passed
+.venv/bin/python -m pytest      # 80 passed
 .venv/bin/ruff check .          # All checks passed
 ```
 

@@ -3,6 +3,8 @@
 只经代理转发（proxy_pool.get_proxy()），绝不直连。
 """
 
+import asyncio
+import contextlib
 import json
 import time
 
@@ -169,6 +171,8 @@ class UpstreamClient:
         for attempt in range(MAX_RETRIES):
             proxy = await self.pool.get_proxy(exclude=excluded)
             started = False
+            reported = False
+            gen = None
             t0 = time.monotonic()
             try:
                 if endpoint == "responses":
@@ -176,40 +180,74 @@ class UpstreamClient:
                 else:
                     gen = self._stream_request(endpoint, proxy, payload)
                 gen = _rewrite_model_bytes(gen, upstream_model, public_model)
-                async for chunk in gen:
+                it = gen.__aiter__()
+                while True:
+                    try:
+                        if not started and self.settings.first_event_timeout > 0:
+                            chunk = await asyncio.wait_for(
+                                it.__anext__(),
+                                timeout=self.settings.first_event_timeout)
+                        else:
+                            chunk = await it.__anext__()
+                    except StopAsyncIteration:
+                        break
                     if not started:
                         started = True
                         # 首字节延迟 = 上游响应快慢的核心信号，记入延迟表
                         ttfb = round((time.monotonic() - t0) * 1000, 1)
                         await self.pool.report(proxy, OK, latency_ms=ttfb)
+                        reported = True
                     yield chunk
                 if not started:
                     await self.pool.report(proxy, OK)
+                    reported = True
                 return
+            except asyncio.TimeoutError:
+                # 连上了但迟迟不吐首字节：换代理，别让请求挂 300s
+                last_err = UpstreamError(
+                    f"upstream first event timeout "
+                    f"({self.settings.first_event_timeout}s)")
+                self.pool.note_error("timeout")
+                if gen is not None:
+                    with contextlib.suppress(Exception):
+                        await gen.aclose()
+                if started:
+                    await self.pool.report(proxy, COOLDOWN)
+                    reported = True
+                    raise last_err
+                await self.pool.report(proxy, COOLDOWN, cooldown_seconds=30)
+                reported = True
+                excluded.add(proxy)
+                continue
             except UpstreamError as e:
                 last_err = e
                 self.pool.note_error(_classify(e.status_code))
                 if started:
                     # 已在出流中途失败：无法重试，标记状态后抛
                     await self.pool.report(proxy, COOLDOWN, cooldown_seconds=e.retry_after)
+                    reported = True
                     raise
                 if e.status_code == 429 or 500 <= e.status_code < 600:
                     self._register_failure()
                     await self.pool.report(
                         proxy, COOLDOWN, cooldown_seconds=e.retry_after)
+                    reported = True
                     excluded.add(proxy)
                     continue
                 if _is_abuse(e):
                     await self.pool.report(proxy, DEAD)
+                    reported = True
                     excluded.add(proxy)
                     continue
                 # 其余 4xx 是请求本身的问题，不惩罚代理
                 self.pool.release(proxy)
+                reported = True
                 raise
             except httpx.TimeoutException as e:
                 last_err = e
                 self.pool.note_error("timeout")
                 await self.pool.report(proxy, DEAD)
+                reported = True
                 if started:
                     raise
                 excluded.add(proxy)
@@ -218,10 +256,16 @@ class UpstreamClient:
                 last_err = e
                 self.pool.note_error("conn")
                 await self.pool.report(proxy, DEAD)
+                reported = True
                 if started:
                     raise
                 excluded.add(proxy)
                 continue
+            finally:
+                # 客户端断开 / 生成器被关闭时也要归还 in-flight，避免面板
+                # 长期显示"在途"、把代理并发额度占死。
+                if not reported:
+                    self.pool.release(proxy)
         raise _retries_exhausted(last_err)
 
     async def _request(self, endpoint: str, proxy: str, payload: dict) -> dict:
@@ -318,7 +362,8 @@ class UpstreamClient:
         proxy_url = f"http://{proxy}"
         try:
             async with httpx.AsyncClient(
-                timeout=15, proxy=proxy_url
+                timeout=httpx.Timeout(connect=5, read=8, write=5, pool=5),
+                proxy=proxy_url,
             ) as client:
                 r = await client.get(f"{self.settings.upstream_base}/models")
                 return r.status_code in (200, 401, 403)
