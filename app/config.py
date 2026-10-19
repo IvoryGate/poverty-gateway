@@ -53,12 +53,14 @@ class Settings:
         # 从"只按延迟排序"升级为"直接过滤"，避免慢/挂代理拖垮请求延迟。
         self.max_latency_ms = self._get_int("MAX_LATENCY_MS", 15000)
 
-        # 对候选 IP 做 zen 连通性筛选的并发数（探测克制，防自我限流。
-        # 3 太低——几百个候选分批串行探测很慢，补池筛不完；8 兼顾并发与克制）
-        self.probe_concurrency = self._get_int("PROBE_CONCURRENCY", 8)
+        # 对候选 IP 做 zen 连通性筛选的并发数。
+        # 候选来自 proxy-pool 的 use_proxy:https（通常几十个），12 并发能
+        # 在一轮内覆盖完，同时避免一次打太多上游。
+        self.probe_concurrency = self._get_int("PROBE_CONCURRENCY", 12)
 
-        # 单次补池最多探测的候选数（候选可能上百个，全量探测太慢）
-        self.probe_batch = self._get_int("PROBE_BATCH", 60)
+        # 单次补池最多探测的候选数。https 候选通常 <100，默认 100 表示
+        # 一轮尽量覆盖全部可达 IP（"尽可能覆盖能正常访问的 IP"）。
+        self.probe_batch = self._get_int("PROBE_BATCH", 100)
 
         # 连通性筛选单 IP 超时（秒）：连不上的快速判定 dead，加速补池。
         # 免费代理质量参差，5s 会误杀响应偏慢但能用的 IP；8s 兼顾成功率与冷启动。
@@ -69,12 +71,20 @@ class Settings:
         # 拿它探测每个 IP 都判 DEAD，zenhit 全扣成负分，取号直接饿死。
         self.probe_model = self._get("PROBE_MODEL", "space-bunny-free")
 
-        # 可用池目标规模：补池到此数即停（候选源持续增长，多 key 需更大池）
-        self.pool_target = self._get_int("POOL_TARGET", 60)
+        # 可用池目标规模：补池到此数即停。https 候选通常只有几十个，
+        # 目标设 100 表示"尽量把能用的都收进来"，而不是人为卡在 60。
+        self.pool_target = self._get_int("POOL_TARGET", 100)
 
-        # 可用池低水位：低于 target 的 2/3 触发补池（默认），可用环境变量覆盖
-        self.pool_low_water = self._get_int(
-            "POOL_LOW_WATER", int(self.pool_target * 2 / 3))
+        # 可用池低水位：低于该值触发补池。免费 IP 被封严重，不能等掉到
+        # 很低才补；20 兼顾及时性与探测频率。
+        self.pool_low_water = self._get_int("POOL_LOW_WATER", 20)
+
+        # 两次补池最小间隔（秒）：避免每个请求都触发一轮全网探测。
+        self.refill_interval = self._get_int("REFILL_INTERVAL", 60)
+
+        # FreeTier abuse 惩罚：被上游判定 abuse 的 IP 按模型禁用的时长。
+        # 默认 12h；比普通冷却（分钟级）重得多。
+        self.abuse_ttl = self._get_int("ABUSE_TTL", 12 * 3600)
 
         # 单个 IP 最大在途并发：超过则取号时跳过，避免同 IP 被打爆
         self.max_in_flight = self._get_int("MAX_IN_FLIGHT", 5)

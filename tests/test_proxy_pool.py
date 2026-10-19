@@ -28,6 +28,7 @@ def make_settings(**kw):
         "pool_low_water": 4,
         "pool_target": 8,
         "max_in_flight": 3,
+        "refill_interval": 0,
     }
     base.update(kw)
     return Settings(**base)
@@ -305,7 +306,7 @@ async def test_cooldown_expiry_allows_reuse():
 
 @pytest.mark.asyncio
 async def test_zen_score_skips_known_bad():
-    """对 zen 历史表现差的候选，补池时排到后面（好 IP 优先探测）。"""
+    """对 zen 历史表现低于 _ZEN_BAD 的候选，补池时直接跳过。"""
 
     def handler(request: httpx.Request) -> httpx.Response:
         proxies = ["1.1.1.1:80", "2.2.2.2:80"]
@@ -320,12 +321,11 @@ async def test_zen_score_skips_known_bad():
         make_settings(pool_target=2, quality_chain="stable3"),
         client=client, probe_fn=probe_fn,
     )
-    # 给 1.1.1.1:80 灌入低于阈值的 score：补池排序时它排最后
+    # 给 1.1.1.1:80 灌入低于阈值的 score：补池时不再浪费探测
     for _ in range(5):
         pool._bump_zen_score("1.1.1.1:80", -1)
-    assert pool._zen_score("1.1.1.1:80") < 0  # 已被标记差
+    assert pool._zen_score("1.1.1.1:80") <= pool._ZEN_BAD
 
     await pool.get_proxy()
-    # 两个候选最终都会入池（排序只影响探测顺序，不硬跳过）
     assert "2.2.2.2:80" in pool._available
-    assert "1.1.1.1:80" in pool._available
+    assert "1.1.1.1:80" not in pool._available

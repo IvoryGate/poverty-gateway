@@ -29,6 +29,7 @@ def create_app(settings: Settings = None):
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         pool.load_snapshot()
+        pool.warm_async()
 
         async def periodic_snapshot():
             """每 24h 落盘一次可用池快照（重启兜底）。"""

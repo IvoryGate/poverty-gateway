@@ -15,9 +15,12 @@
 """
 
 import asyncio
+import json
 import logging
+import time
 
 import httpx
+import redis as redis_py
 
 from app.config import Settings
 from app.core.headers import probe_payload, zen_headers
@@ -29,14 +32,17 @@ logger = logging.getLogger(__name__)
 OK = "ok"                 # 真实请求成功，可用
 COOLDOWN = "cooldown"     # 限流，短期回避（指数退避）
 DEAD = "dead"             # 连接失败，剔除
+ABUSE = "abuse"           # 上游 FreeTier abuse：重罚 + 按模型长期禁用
 
 # Redis 键前缀
 _K_INFLIGHT = "inflight:"   # in-flight 计数
 _K_COOLDOWN = "cooldown:"   # 冷却区（值 = "strike:quality"，带 TTL）
 _K_LATENCY = "latency:"     # 延迟估计（ms，EWMA，跨 worker 共享，TTL 6h）
+_K_ABUSE = "abuse:"         # abuse 黑名单：abuse:<model>:<proxy>
 _K_SNAPSHOT = "pool_snapshot"   # 可用池快照（JSON，TTL 24h）
 _SNAPSHOT_TTL = 86400
 _LATENCY_TTL = 6 * 3600
+_ABUSE_TTL = 12 * 3600      # abuse 一次禁 12h（可被 env 覆盖）
 
 
 def _as_int(raw) -> int:
@@ -66,6 +72,7 @@ class ProxyPool:
         # 状态机（_available 进程内；in-flight/冷却走 store）
         self._available: dict[str, dict] = {}   # proxy -> {"quality": str}
         self._warm = False                      # 是否已做过首次补池
+        self._last_refill = 0.0                 # 上次补池开始时间（节流用）
         # 延迟表：proxy -> EWMA 耗时(ms)，真实请求/探测回写，取号按此排序
         self._latency: dict[str, float] = {}    # proxy -> 最近平均耗时 ms
 
@@ -74,6 +81,7 @@ class ProxyPool:
             "refill_count": 0,       # 补池次数
             "cooldown_reports": 0,   # 真实请求 429 回写次数
             "dead_reports": 0,       # 真实请求连接失败回写次数
+            "abuse_reports": 0,      # 上游 FreeTier abuse 回写次数
             "no_proxy_errors": 0,    # 取号失败次数
             "errors": {              # 错误构成：429 / 5xx / 4xx / timeout / conn
                 "429": 0,
@@ -88,10 +96,12 @@ class ProxyPool:
 
     # ---------- 对外接口 ----------
 
-    async def get_proxy(self, exclude: set[str] | None = None) -> str:
+    async def get_proxy(self, exclude: set[str] | None = None,
+                        model: str | None = None) -> str:
         """取一个可用代理：优先冷启动补池/低水位补池，然后选最空闲的。
 
         exclude: 本次要避开的代理集合（当前请求已失败过的不再选）。
+        model: 本次请求的对外模型；用于避开该模型被 abuse 的 IP。
         返回 "ip:port"。无可用代理时抛 NoProxyAvailable。
         """
         exclude = exclude or set()
@@ -108,12 +118,15 @@ class ProxyPool:
                 if p not in exclude
                 and _as_int(self._store.get(_K_INFLIGHT + p)) < self.settings.max_in_flight
                 and not self._store.exists(_K_COOLDOWN + p)
+                and not self._in_abuse(p, model)
             ]
             if not base_candidates:
-                # 全部在途满/冷却/被排除：取最空闲且未冷却的兜底（宁缺毋滥，不选冷却 IP）
+                # 全部在途满/冷却/被排除：取最空闲且未冷却的兜底（宁缺毋滥）
                 base_candidates = [
                     p for p in self._available
-                    if p not in exclude and not self._store.exists(_K_COOLDOWN + p)
+                    if p not in exclude
+                    and not self._store.exists(_K_COOLDOWN + p)
+                    and not self._in_abuse(p, model)
                 ]
             if not base_candidates:
                 self._metrics["no_proxy_errors"] += 1
@@ -152,18 +165,21 @@ class ProxyPool:
         self._store.decr(_K_INFLIGHT + proxy)
 
     async def report(self, proxy: str, status: str, cooldown_seconds: int = 0,
-                     latency_ms: float = 0.0):
+                     latency_ms: float = 0.0, model: str | None = None):
         """真实请求结果回写池状态（隐式探测，不额外消耗上游）。
 
         cooldown_seconds: 429 时上游返回的解封秒数（retry-after），
         有则用它精确设定冷却时长，到期第一时间复活。
         latency_ms: 本次请求总耗时（ms），成功时并入 EWMA 延迟表，
         取号按此排序优先选快 IP。
+        model: 本次请求的模型；abuse 黑名单按模型隔离，避免 GLM 的
+        403 把 space-bunny 也能用的 IP 一起打死。
         """
         async with self._lock:
             self._store.decr(_K_INFLIGHT + proxy)
             if status == OK:
                 self._store.delete(_K_COOLDOWN + proxy)
+                self._clear_abuse(proxy, model)
                 if latency_ms > 0:
                     self._update_latency(proxy, latency_ms)
                 if proxy not in self._available:
@@ -177,6 +193,9 @@ class ProxyPool:
                 self._available.pop(proxy, None)
                 self._store.delete(_K_COOLDOWN + proxy)
                 self._bump_zen_score(proxy, -1)
+            elif status == ABUSE:
+                self._metrics["abuse_reports"] += 1
+                self._mark_abuse(proxy, model)
 
     def _update_latency(self, proxy: str, latency_ms: float):
         """EWMA 更新某 IP 的延迟估计，平滑抖动（α=0.3 偏重近期）。
@@ -214,6 +233,7 @@ class ProxyPool:
         """代理池水位与健康指标（快照）。"""
         in_flight = sum(_as_int(self._store.get(_K_INFLIGHT + p)) for p in self._available)
         cooldown_n = len(self._store.keys(_K_COOLDOWN + "*"))
+        abuse_n = len(self._store.keys(_K_ABUSE + "*"))
         # 真实可用 = 不在冷却中的占位（冷却的不算可用）
         usable = self._usable_count()
         lat = self._store.keys(_K_LATENCY + "*")
@@ -232,11 +252,13 @@ class ProxyPool:
             "pool_size": len(self._available),
             "in_flight": in_flight,
             "cooldown": cooldown_n,
+            "abuse": abuse_n,
             "target": self.settings.pool_target,
             "low_water": self.settings.pool_low_water,
             "refill_count": self._metrics["refill_count"],
             "cooldown_reports": self._metrics["cooldown_reports"],
             "dead_reports": self._metrics["dead_reports"],
+            "abuse_reports": self._metrics["abuse_reports"],
             "no_proxy_errors": self._metrics["no_proxy_errors"],
             "latency_median_ms": round(latency_median, 1),
             "latency_sampled": len(lat),
@@ -255,10 +277,11 @@ class ProxyPool:
         return self._usable_count() < self.settings.pool_low_water
 
     def _usable_count(self) -> int:
-        """真实可用数：_available 里不在冷却中的 IP 数。"""
+        """真实可用数：_available 里不在冷却/全局 abuse 中的 IP 数。"""
         return sum(
             1 for p in self._available
-            if not self._store.exists(_K_COOLDOWN + p))
+            if not self._store.exists(_K_COOLDOWN + p)
+            and not self._in_abuse(p, None))
 
     def save_snapshot(self):
         """把当前可用池快照写入 Redis（优雅停机/定时落盘用）。
@@ -338,6 +361,38 @@ class ProxyPool:
     def _in_cooldown(self, proxy: str) -> bool:
         return self._store.exists(_K_COOLDOWN + proxy)
 
+    @staticmethod
+    def _abuse_key(proxy: str, model: str | None) -> str:
+        return f"{_K_ABUSE}{model or '*'}:{proxy}"
+
+    def _in_abuse(self, proxy: str, model: str | None = None) -> bool:
+        """该 IP 是否被全局或指定模型 abuse 禁用。"""
+        if self._store.exists(self._abuse_key(proxy, None)):
+            return True
+        return bool(model and self._store.exists(self._abuse_key(proxy, model)))
+
+    def _mark_abuse(self, proxy: str, model: str | None = None,
+                    quality: str = ""):
+        """FreeTier abuse：直接移出可用池 + 按模型禁用 12h + 重扣信任分。
+
+        abuse 是上游对出口 IP 的明确拒绝，比连接失败严重得多：
+        - 立即从 _available 移除，当前请求换 IP；
+        - 写 abuse:<model>:<proxy>，TTL 内该模型取号直接跳过；
+        - zenhit -10，即使 TTL 到期也不会马上被当成好 IP。
+        """
+        self._available.pop(proxy, None)
+        self._store.delete(_K_COOLDOWN + proxy)
+        self._store.setex(
+            self._abuse_key(proxy, model),
+            self.settings.abuse_ttl,
+            str(int(time.time())),
+        )
+        self._bump_zen_score(proxy, -10)
+
+    def _clear_abuse(self, proxy: str, model: str | None = None):
+        """真实请求成功：清掉该模型的 abuse 记录（说明 IP 已恢复）。"""
+        self._store.delete(self._abuse_key(proxy, model))
+
     _K_ZEN_SCORE = "zenhit:"   # 候选 IP 对 zen 的历史表现计数（score）
     _ZEN_BAD = -3              # score 低于此视为"对 zen 长期不可用"，补池跳过
 
@@ -365,14 +420,23 @@ class ProxyPool:
     def _schedule_refill(self):
         """低水位时触发后台补池（非阻塞，防 get_proxy 长时间持锁）。
 
-        单飞保护：同一时刻只有一个补池任务在跑，避免并发重复探测。
-        补池在后台探测，只短暂取锁把结果并入 _available，不影响取号。
+        单飞保护：同一时刻只有一个补池任务在跑。
+        最小间隔：两次补池之间至少隔 refill_interval 秒，避免每个请求都
+        触发一轮全网探测（免费代理/上游都扛不住）。
         """
+        now = time.monotonic()
+        if now - self._last_refill < self.settings.refill_interval:
+            return
         if self._refill_task is not None and not self._refill_task.done():
             return  # 已有补池在跑
         task = asyncio.create_task(self._refill())
         task.add_done_callback(self._refill_done)
         self._refill_task = task
+
+    def warm_async(self):
+        """启动时在后台补池：不阻塞第一个请求，先把能用的 IP 尽量收进来。"""
+        self._warm = True
+        self._schedule_refill()
 
     def _refill_done(self, task: asyncio.Task):
         """补池结束回调：消费异常，避免 'Task exception was never retrieved' 刷屏。"""
@@ -392,22 +456,24 @@ class ProxyPool:
         探测阶段不持主锁（get_proxy 用），只在并入 _available 时短暂取锁。
         """
         self._warm = True
+        self._last_refill = time.monotonic()
         self._metrics["refill_count"] += 1
         chain = self.settings.quality_chain
-        probe_conc = min(self.settings.probe_concurrency, 10)
+        probe_conc = min(self.settings.probe_concurrency, 16)
         batch = max(self.settings.probe_batch, 20)
         for quality in chain:
             quality = quality.strip()
             raw = await self._fetch_candidates(quality)
             if not raw:
                 continue
-            # 过滤出需探测的新 IP：不在可用池、不在冷却区。
-            # 按历史 score 降序排序：表现好的优先探测；表现差的排最后
-            # （仅降低优先级，不硬性跳过——避免候选被过度排除导致无米下锅，
-            # 6h TTL 也会让失败的 IP 有机会按配额周期复活）。
+            # 过滤出需探测的新 IP：不在可用池、不在冷却、不被 abuse 禁用。
+            # 负分太低的 IP 直接跳过（_ZEN_BAD），避免反复探测已知死货。
             pending = [
                 p for p in raw
-                if p not in self._available and not self._in_cooldown(p)
+                if p not in self._available
+                and not self._in_cooldown(p)
+                and not self._in_abuse(p, self.settings.probe_model)
+                and self._zen_score(p) > self._ZEN_BAD
             ]
             pending.sort(key=self._zen_score, reverse=True)
             pos = 0
@@ -425,16 +491,64 @@ class ProxyPool:
                 break
 
     async def _fetch_candidates(self, quality: str) -> list[str]:
-        """取候选 IP：优先从 proxy-pool 的 Redis 读全量（db0 use_proxy）。
+        """取候选 IP：优先 proxy-pool 的 use_proxy:https（目标可达），
+        再回退到全量 hash / /get。
 
-        绕开 proxy-pool 按 stable 加权的取号逻辑——stable 是它对探活目标的
-        评分，与"zen 是否限流该 IP"无关。直接读全量 IP，用我们自己的 zen
-        探测筛出当前真正可用的。Redis 不可用时回退到 proxy-pool /get。
+        为什么优先 https：网关只走 HTTPS 上游，proxy-pool 的 https 集合已经
+        验证过"能连到 opencode.ai"。全量 hash 里大量 HTTP-only 代理永远
+        不可能转发成功，探测它们纯属浪费（也是"池子长期补不满"的原因之一）。
         """
-        ips = await asyncio.to_thread(self._read_all_from_redis)
+        ips = await asyncio.to_thread(self._read_https_from_redis)
+        if not ips:
+            ips = await asyncio.to_thread(self._read_all_from_redis)
         if not ips:
             ips = await self._fetch_from_api(quality)
         return ips
+
+    def _read_https_from_redis(self) -> list[str]:
+        """从 proxy-pool Redis db0 读 https 候选，按 score/延迟排序。"""
+        if not self.settings.redis_url:
+            return []
+        try:
+            from urllib.parse import urlparse, urlunparse
+
+            parsed = urlparse(self.settings.redis_url)
+            clean = urlunparse(parsed._replace(path="/0"))
+            r = redis_py.Redis.from_url(
+                clean, decode_responses=True, socket_connect_timeout=3,
+                socket_timeout=3,
+            )
+            members = set(r.smembers("use_proxy:https") or [])
+            if not members:
+                return []
+            meta = r.hgetall("use_proxy") or {}
+            ordered = []
+            for proxy in members:
+                raw = meta.get(proxy)
+                score, latency = 0, float("inf")
+                if raw:
+                    try:
+                        item = json.loads(raw)
+                    except (TypeError, ValueError):
+                        item = {}
+                    if item.get("tampered"):
+                        continue
+                    if item.get("last_status") is False:
+                        continue
+                    try:
+                        score = int(item.get("score") or 0)
+                    except (TypeError, ValueError):
+                        score = 0
+                    if item.get("latency_ms") is not None:
+                        try:
+                            latency = float(item["latency_ms"])
+                        except (TypeError, ValueError):
+                            latency = float("inf")
+                ordered.append((-score, latency, proxy))
+            ordered.sort()
+            return [proxy for _, _, proxy in ordered]
+        except (redis_py.RedisError, ImportError, ValueError):
+            return []
 
     def _read_all_from_redis(self) -> list[str]:
         """从 proxy-pool Redis（db0 use_proxy）读全量 IP。
@@ -445,7 +559,6 @@ class ProxyPool:
         try:
             from urllib.parse import urlparse, urlunparse
 
-            import redis as redis_py
             parsed = urlparse(self.settings.redis_url)
             # 强制 db=0（proxy-pool 数据所在库）
             clean = urlunparse(parsed._replace(path="/0"))
@@ -500,6 +613,9 @@ class ProxyPool:
                     self._mark_cooldown(
                         proxy, quality,
                         cooldown_seconds=self._probe_retry.get(proxy, 0))
+                elif status == ABUSE:
+                    # 上游明确 abuse：按探测模型长期禁用，不再反复探测
+                    self._mark_abuse(proxy, self.settings.probe_model, quality)
                 else:
                     # DEAD/超时/连不上：记忆负面表现，下次补池降低优先级
                     self._bump_zen_score(proxy, -1)
@@ -523,13 +639,13 @@ class ProxyPool:
         无需额外请求。
         注：httpx 0.28 代理参数在 client 构造时传，每 IP 独立 client。
         """
-        import time
         url = f"{self.settings.upstream_base}/chat/completions"
         proxy_url = f"http://{proxy}"
         body = probe_payload(self.settings.probe_model)
         t0 = time.monotonic()
         retry_after = 0
         status = 0
+        abuse = False
         try:
             async with httpx.AsyncClient(
                 proxy=proxy_url, timeout=self.settings.probe_timeout,
@@ -547,7 +663,9 @@ class ProxyPool:
                 elif status == 403:
                     raw = await r.aread()
                     detail = raw[:300].decode("utf-8", errors="replace")
-                    if "Detect Abuse Traffic" not in detail:
+                    if "Detect Abuse Traffic" in detail:
+                        abuse = True
+                    else:
                         logger.warning(
                             "探测被上游形状校验拒绝（请求头/body 可能又变了）:"
                             " %s", detail)
@@ -560,4 +678,6 @@ class ProxyPool:
         if status == 429:
             self._probe_retry[proxy] = retry_after
             return COOLDOWN
+        if abuse:
+            return ABUSE
         return DEAD

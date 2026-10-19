@@ -164,6 +164,10 @@ async def test_chat_stream_abuse_403_rotates_proxy():
     assert calls["n"] == 2
     assert chunks == [b"data: [DONE]\n\n"]
     assert "1.1.1.1:80" not in client.pool._available
+    # abuse 按上游模型名禁用，不影响其他模型
+    assert client.pool._in_abuse("1.1.1.1:80", "deepseek-v4-flash-free")
+    assert not client.pool._in_abuse("1.1.1.1:80", "space-bunny-free")
+    assert client.pool.metrics()["abuse_reports"] == 1
 
 
 @pytest.mark.asyncio

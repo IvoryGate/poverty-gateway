@@ -43,8 +43,11 @@ pip install -r requirements.txt
 | `REDIS_URL` | `redis://127.0.0.1:6379/1` | 网关状态库 |
 | `UPSTREAM_BASE` | `https://opencode.ai/zen/v1` | 上游 zen |
 | `PROXY_POOL_URL` | `http://127.0.0.1:5010` | proxy-pool API |
-| `POOL_TARGET` / `POOL_LOW_WATER` | 60 / 40 | 池水位 |
-| `PROBE_CONCURRENCY` | 8 | 候选探测并发 |
+| `POOL_TARGET` / `POOL_LOW_WATER` | 100 / 20 | 池水位（尽量覆盖可用 IP） |
+| `PROBE_CONCURRENCY` | 12 | 候选探测并发 |
+| `PROBE_BATCH` | 100 | 单轮最多探测候选数 |
+| `REFILL_INTERVAL` | 60 | 两次补池最小间隔（秒） |
+| `ABUSE_TTL` | 43200 | FreeTier abuse 按模型禁用时长（秒，12h） |
 | `PROBE_MODEL` | `space-bunny-free` | 探测用上游模型 |
 | `FIRST_EVENT_TIMEOUT` | 15 | 首字节超时（秒），超时换代理；0 关闭 |
 | `FIRST_EVENT_TIMEOUT_MEDIUM` | 90 | 请求体 ≥80KB 时的首字节超时 |

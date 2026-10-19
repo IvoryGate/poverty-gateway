@@ -14,6 +14,7 @@ from app.config import Settings
 from app.core.headers import zen_headers
 from app.core.model_map import ModelMapper
 from app.core.proxy_pool import (
+    ABUSE,
     COOLDOWN,
     DEAD,
     OK,
@@ -129,12 +130,12 @@ class UpstreamClient:
         last_err = None
         excluded: set[str] = set()
         for attempt in range(MAX_RETRIES):
-            proxy = await self.pool.get_proxy(exclude=excluded)
+            proxy = await self.pool.get_proxy(exclude=excluded, model=upstream_model)
             t0 = time.monotonic()
             try:
                 result = await self._request(endpoint, proxy, payload)
                 elapsed_ms = round((time.monotonic() - t0) * 1000, 1)
-                await self.pool.report(proxy, OK, latency_ms=elapsed_ms)
+                await self.pool.report(proxy, OK, latency_ms=elapsed_ms, model=upstream_model)
                 if isinstance(result, dict) and "model" in result:
                     result["model"] = public_model
                 return result
@@ -145,12 +146,12 @@ class UpstreamClient:
                     # 限流 / 上游 5xx：换代理重试
                     self._register_failure()
                     await self.pool.report(
-                        proxy, COOLDOWN, cooldown_seconds=e.retry_after)
+                        proxy, COOLDOWN, cooldown_seconds=e.retry_after, model=upstream_model)
                     excluded.add(proxy)
                     continue
                 if _is_abuse(e):
                     # 上游按 IP 判定滥用：这个 IP 对 free 档不可用，换下一个
-                    await self.pool.report(proxy, DEAD)
+                    await self.pool.report(proxy, ABUSE, model=upstream_model)
                     excluded.add(proxy)
                     continue
                 # 其余 4xx（参数/模型不支持/形状校验）是请求本身的问题，
@@ -161,14 +162,14 @@ class UpstreamClient:
                 # 传输超时：代理慢/挂，剔除换一个（记入 timeout 桶）
                 last_err = e
                 self.pool.note_error("timeout")
-                await self.pool.report(proxy, DEAD)
+                await self.pool.report(proxy, DEAD, model=upstream_model)
                 excluded.add(proxy)
                 continue
             except httpx.HTTPError as e:
                 # 连接/传输层失败：该代理不可用，剔除后换一个
                 last_err = e
                 self.pool.note_error("conn")
-                await self.pool.report(proxy, DEAD)
+                await self.pool.report(proxy, DEAD, model=upstream_model)
                 excluded.add(proxy)
                 continue
         raise _retries_exhausted(last_err)
@@ -199,7 +200,7 @@ class UpstreamClient:
                 break
             attempt_timeout = (
                 min(first_timeout, remaining) if first_timeout > 0 else 0)
-            proxy = await self.pool.get_proxy(exclude=excluded)
+            proxy = await self.pool.get_proxy(exclude=excluded, model=upstream_model)
             started = False
             reported = False
             gen = None
@@ -225,11 +226,11 @@ class UpstreamClient:
                         started = True
                         # 首字节延迟 = 上游响应快慢的核心信号，记入延迟表
                         ttfb = round((time.monotonic() - t0) * 1000, 1)
-                        await self.pool.report(proxy, OK, latency_ms=ttfb)
+                        await self.pool.report(proxy, OK, latency_ms=ttfb, model=upstream_model)
                         reported = True
                     yield chunk
                 if not started:
-                    await self.pool.report(proxy, OK)
+                    await self.pool.report(proxy, OK, model=upstream_model)
                     reported = True
                 return
             except asyncio.TimeoutError:
@@ -241,10 +242,10 @@ class UpstreamClient:
                     with contextlib.suppress(Exception):
                         await gen.aclose()
                 if started:
-                    await self.pool.report(proxy, COOLDOWN)
+                    await self.pool.report(proxy, COOLDOWN, model=upstream_model)
                     reported = True
                     raise last_err
-                await self.pool.report(proxy, COOLDOWN, cooldown_seconds=30)
+                await self.pool.report(proxy, COOLDOWN, cooldown_seconds=30, model=upstream_model)
                 reported = True
                 excluded.add(proxy)
                 continue
@@ -253,18 +254,18 @@ class UpstreamClient:
                 self.pool.note_error(_classify(e.status_code))
                 if started:
                     # 已在出流中途失败：无法重试，标记状态后抛
-                    await self.pool.report(proxy, COOLDOWN, cooldown_seconds=e.retry_after)
+                    await self.pool.report(proxy, COOLDOWN, cooldown_seconds=e.retry_after, model=upstream_model)
                     reported = True
                     raise
                 if e.status_code == 429 or 500 <= e.status_code < 600:
                     self._register_failure()
                     await self.pool.report(
-                        proxy, COOLDOWN, cooldown_seconds=e.retry_after)
+                        proxy, COOLDOWN, cooldown_seconds=e.retry_after, model=upstream_model)
                     reported = True
                     excluded.add(proxy)
                     continue
                 if _is_abuse(e):
-                    await self.pool.report(proxy, DEAD)
+                    await self.pool.report(proxy, ABUSE, model=upstream_model)
                     reported = True
                     excluded.add(proxy)
                     continue
@@ -275,7 +276,7 @@ class UpstreamClient:
             except httpx.TimeoutException as e:
                 last_err = e
                 self.pool.note_error("timeout")
-                await self.pool.report(proxy, DEAD)
+                await self.pool.report(proxy, DEAD, model=upstream_model)
                 reported = True
                 if started:
                     raise
@@ -284,7 +285,7 @@ class UpstreamClient:
             except httpx.HTTPError as e:
                 last_err = e
                 self.pool.note_error("conn")
-                await self.pool.report(proxy, DEAD)
+                await self.pool.report(proxy, DEAD, model=upstream_model)
                 reported = True
                 if started:
                     raise
