@@ -6,10 +6,11 @@
 > 上游封禁加剧后，旧策略（per-IP zenhit + 单一 probe 模型 + abuse 仅当 DEAD）
 > 学不到"这个 IP 对某个模型 abuse"；GLM 这类模型反复失败，而 space-bunny 仍
 > 正常。改为：abuse 按**上游模型名**记 12h 黑名单（`abuse:<model>:<ip>`），
-> 立即移出可用池、zenhit -10，取号/补池都跳过；成功才清除。候选优先读
-> proxy-pool 的 `use_proxy:https`（目标可达），启动后台 warm，探测并发 12/
-> 单批 100、目标 100/低水位 20、补池间隔 60s，尽量覆盖全部可用 IP。
-> `_ZEN_BAD` 现在真正跳过。81 测试通过。**待重启网关生效。**
+> 立即移出可用池、zenhit -10，取号/补池都跳过；成功才清除。同时兼容上游
+> 新文案 "detected abusive traffic from this IP address"（`app/core/freetier.py`）。
+> 候选优先读 proxy-pool 的 `use_proxy:https`（目标可达），启动后台 warm，
+> 探测并发 12/单批 100、目标 100/低水位 20、补池间隔 60s，尽量覆盖全部可用 IP。
+> `_ZEN_BAD` 现在真正跳过。85 测试通过。**待重启网关生效。**
 
 **阶段 20 完成（首字节超时 + in-flight 泄漏修复）**
 > 本地 opencode 请求一直无响应、面板长期显示在途。根因不是没代理，而是：

@@ -23,6 +23,7 @@ import httpx
 import redis as redis_py
 
 from app.config import Settings
+from app.core.freetier import is_abuse_message
 from app.core.headers import probe_payload, zen_headers
 from app.core.redis_store import RedisStore
 
@@ -663,7 +664,7 @@ class ProxyPool:
                 elif status == 403:
                     raw = await r.aread()
                     detail = raw[:300].decode("utf-8", errors="replace")
-                    if "Detect Abuse Traffic" in detail:
+                    if is_abuse_message(detail):
                         abuse = True
                     else:
                         logger.warning(

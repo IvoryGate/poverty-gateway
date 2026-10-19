@@ -11,6 +11,7 @@ import time
 import httpx
 
 from app.config import Settings
+from app.core.freetier import is_abuse_message
 from app.core.headers import zen_headers
 from app.core.model_map import ModelMapper
 from app.core.proxy_pool import (
@@ -698,7 +699,7 @@ def _is_abuse(e: "UpstreamError") -> bool:
     message = ""
     if isinstance(e.error_body, dict):
         message = str(e.error_body.get("message") or "")
-    return "Detect Abuse Traffic" in (message or str(e))
+    return is_abuse_message(message or str(e))
 
 
 def _sanitize_responses(payload: dict) -> dict:
