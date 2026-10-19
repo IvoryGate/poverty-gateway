@@ -63,10 +63,13 @@ pip install -r requirements.txt
 
 兼容两种 baseURL：`https://api.pixelreeds.com` 与 `.../v1`。
 
+上游 FreeTier（请求形状 / IP abuse）不会透传给客户端：统一收口为
+503 `upstream_unavailable`，429 时为 `rate_limit_error`。
+
 ## 测试
 
 ```bash
-.venv/bin/python -m pytest      # 85 passed
+.venv/bin/python -m pytest      # 89 passed
 .venv/bin/ruff check .          # All checks passed
 ```
 

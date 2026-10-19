@@ -78,6 +78,24 @@ def make_app(upstream_handler, proxies=None, api_keys=None):
 
     upstream._stream_request = fake_stream  # type: ignore[method-assign]
 
+    # Responses 非流式也改成内部流式聚合，mock 对应入口
+    async def fake_responses_stream(proxy: str, payload: dict):
+        r = await client.post("https://upstream.test/responses", json=payload)
+        if r.status_code >= 400:
+            from app.services.upstream import UpstreamError
+            raise UpstreamError(f"upstream {r.status_code}: {r.text}",
+                                status_code=r.status_code)
+        if r.content.lstrip().startswith((b"data:", b"event:")):
+            yield r.content
+        else:
+            import json
+            obj = r.json()
+            yield ("data: " + json.dumps({
+                "type": "response.completed", "response": obj,
+            }) + "\n\n").encode()
+
+    upstream._responses_stream_request = fake_responses_stream  # type: ignore[method-assign]
+
     app = create_app(settings)
     app.state.upstream = upstream
     return app
@@ -437,3 +455,64 @@ async def test_stats_tracks_usage():
     assert "pool" in data
     assert "available" in data["pool"]
     assert data["pool"]["refill_count"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_upstream_freetier_masked_as_503():
+    """FreeTier 只留在网关内部：对外 503 upstream_unavailable，不透传文案。"""
+    from app.services.upstream import UpstreamError
+
+    app = make_app(lambda r: httpx.Response(200, json={}))
+
+    async def fail_chat(model, payload):
+        raise UpstreamError(
+            "upstream 403: FreeTierError",
+            status_code=403,
+            error_body={
+                "type": "FreeTierError",
+                "message": "OpenCode's free models aren't available from your "
+                           "current network because we've detected abusive traffic",
+            })
+
+    app.state.upstream.chat = fail_chat  # type: ignore[method-assign]
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        r = await ac.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer sk-alice"},
+            json={"model": "deepseek-v4-flash-lite",
+                  "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 503
+    body = r.json()
+    assert body["error"]["type"] == "upstream_unavailable"
+    assert "FreeTier" not in body["error"]["message"]
+    assert "OpenCode" not in body["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_upstream_freetier_sse_masked():
+    """流式 FreeTier 同样收口成 upstream_unavailable。"""
+    from app.services.upstream import UpstreamError
+
+    app = make_app(lambda r: httpx.Response(200))
+
+    async def fail_stream(model, payload):
+        raise UpstreamError(
+            "upstream 403: FreeTierError",
+            status_code=403,
+            error_body={"type": "FreeTierError",
+                        "message": "detected abusive traffic from this IP"})
+        yield  # pragma: no cover
+
+    app.state.upstream.chat_stream = fail_stream  # type: ignore[method-assign]
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        r = await ac.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer sk-alice"},
+            json={"model": "deepseek-v4-flash-lite", "stream": True,
+                  "messages": [{"role": "user", "content": "hi"}]})
+    text = r.text
+    assert "upstream_unavailable" in text
+    assert "FreeTier" not in text
+    assert "abusive traffic" not in text

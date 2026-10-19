@@ -477,3 +477,38 @@ def test_first_event_timeout_scales_with_body_size():
     assert _first_event_timeout(s, medium) == 90
     assert _first_event_timeout(s, large) == 240
     assert _first_event_timeout(Settings(first_event_timeout=0), small) == 0
+
+
+def test_responses_stream_collector_aggregates_completed():
+    """Responses 非流式聚合：response.completed 里的 response 原样返回。"""
+    from app.services.upstream import _ResponsesStreamCollector
+
+    c = _ResponsesStreamCollector("glm-5.3-flash-lite")
+    c.feed(b'data: {"type":"response.output_text.delta","delta":"hello"}\n\n')
+    c.feed(b'data: {"type":"response.completed","response":{"id":"resp_1",'
+           b'"object":"response","status":"completed","output":[]}}\n\n')
+    out = c.result()
+    assert out["id"] == "resp_1"
+    assert out["model"] == "glm-5.3-flash-lite"
+    assert out["output"][0]["content"][0]["text"] == "hello"
+
+
+@pytest.mark.asyncio
+async def test_responses_non_stream_uses_stream_path():
+    """非流式 responses 不再走 stream=false 的裸透传。"""
+    calls = {"n": 0}
+
+    async def fake_responses_stream(proxy: str, payload: dict):
+        calls["n"] += 1
+        assert payload["stream"] is True
+        yield (b'data: {"type":"response.completed","response":'
+               b'{"id":"resp_x","object":"response","status":"completed",'
+               b'"output":[]}}\n\n')
+
+    client = make_client(lambda r: httpx.Response(200))
+    client._responses_stream_request = fake_responses_stream  # type: ignore[method-assign]
+    result = await client.responses(
+        "deepseek-v4-flash-lite", {"model": "x", "input": "hi"})
+    assert calls["n"] == 1
+    assert result["id"] == "resp_x"
+    assert result["model"] == "deepseek-v4-flash-lite"

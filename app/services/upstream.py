@@ -100,10 +100,17 @@ class UpstreamClient:
             yield chunk
 
     async def responses(self, public_model: str, payload: dict):
-        """转发一次 Responses API 请求（非流式，Codex 用）。"""
-        return await self._forward(
-            "responses", public_model, _sanitize_responses(payload),
-            force_stream=False)
+        """转发一次 Responses API 请求（非流式，Codex 用）。
+
+        上游 free 档只接受 stream=true，这里内部走流式并聚合出标准
+        ``response`` 对象，避免非流式请求撞 FreeTierError。
+        """
+        payload = _sanitize_responses(payload)
+        collector = _ResponsesStreamCollector(public_model)
+        async for chunk in self._forward_stream(
+                "responses", public_model, payload):
+            collector.feed(chunk)
+        return collector.result()
 
     async def responses_stream(self, public_model: str, payload: dict):
         """转发一次 Responses API 请求（流式，Codex 用）。"""
@@ -654,6 +661,62 @@ class _ChatStreamCollector:
         if self.usage:
             result["usage"] = self.usage
         return result
+
+
+class _ResponsesStreamCollector:
+    """把上游 Responses SSE 聚合成一个非流式 ``response`` 对象。"""
+
+    def __init__(self, public_model: str):
+        self.public_model = public_model
+        self.buf = ""
+        self.response: dict | None = None
+        self.text: list[str] = []
+
+    def feed(self, chunk: bytes):
+        self.buf += chunk.decode("utf-8", errors="replace")
+        self.buf = self.buf.replace("\r\n", "\n")
+        while "\n\n" in self.buf:
+            frame, self.buf = self.buf.split("\n\n", 1)
+            self._handle_frame(frame)
+
+    def _handle_frame(self, frame: str):
+        for line in frame.splitlines():
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if not data or data == "[DONE]":
+                continue
+            try:
+                obj = json.loads(data)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            event_type = obj.get("type")
+            if event_type == "response.completed" and isinstance(
+                    obj.get("response"), dict):
+                self.response = obj["response"]
+            elif event_type == "response.output_text.delta":
+                if isinstance(obj.get("delta"), str):
+                    self.text.append(obj["delta"])
+            elif obj.get("object") == "response" and obj.get("output"):
+                self.response = obj
+
+    def result(self) -> dict:
+        text = "".join(self.text)
+        response = dict(self.response) if self.response else {}
+        response["model"] = self.public_model
+        if not response.get("id"):
+            response["id"] = f"resp_{int(time.time() * 1000)}"
+        response.setdefault("object", "response")
+        response.setdefault("status", "completed")
+        if not response.get("output") and text:
+            response["output"] = [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": text}],
+            }]
+        return response
 
 
 def _normalize_chat_payload(payload: dict) -> dict:

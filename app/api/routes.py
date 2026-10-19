@@ -14,6 +14,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from app.core.auth import AuthError, AuthManager, RateLimitExceeded
+from app.core.freetier import is_freetier_message
 from app.core.proxy_pool import NoProxyAvailable
 from app.core.usage import UsageTracker
 from app.services.upstream import UpstreamClient, UpstreamError
@@ -112,7 +113,7 @@ async def _responses(request: Request, key: str):
             except NoProxyAvailable as e:
                 yield _sse_error(str(e))
             except UpstreamError as e:
-                yield _sse_error(str(e), _sse_error_type(e))
+                yield _sse_error(_public_error_message(e), _sse_error_type(e))
             finally:
                 usage.record(key, success=ok,
                              latency_ms=(time.time() - t0) * 1000,
@@ -188,7 +189,7 @@ async def _stream_completions(client: UpstreamClient, model: str, payload: dict,
         except NoProxyAvailable as e:
             yield _sse_error(str(e))
         except UpstreamError as e:
-            yield _sse_error(str(e), _sse_error_type(e))
+            yield _sse_error(_public_error_message(e), _sse_error_type(e))
         finally:
             usage.record(key, success=ok, latency_ms=(time.time() - t0) * 1000,
                          tokens_in=ti, tokens_out=to)
@@ -198,6 +199,22 @@ async def _stream_completions(client: UpstreamClient, model: str, payload: dict,
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+def _is_freetier_error(e: UpstreamError) -> bool:
+    body = e.error_body or {}
+    msg = str(body.get("message") or str(e))
+    return is_freetier_message(msg)
+
+
+def _public_error_message(e: UpstreamError) -> str:
+    """对外错误文案：FreeTier 一律收口，不透传上游 "OpenCode free tier" 字样。"""
+    if _is_freetier_error(e):
+        if e.status_code == 429:
+            return "upstream free tier is rate limited; please retry later"
+        return "upstream free tier is temporarily unavailable; please retry later"
+    body = e.error_body or {}
+    return body.get("message") or str(e)
 
 
 def _sse_error(message: str, err_type: str = "proxy_pool_error") -> bytes:
@@ -210,42 +227,49 @@ def _sse_error_type(e: UpstreamError) -> str:
     """从上游错误里推断 SSE error 事件的 type（429→rate_limit_error 等）。"""
     if e.status_code == 429:
         return "rate_limit_error"
+    if _is_freetier_error(e):
+        return "upstream_unavailable"
     body = e.error_body or {}
     t = body.get("type")
     return t if isinstance(t, str) and t else "upstream_error"
 
 
 def _upstream_error(e: UpstreamError) -> JSONResponse:
-    """把上游错误转成客户可识别的响应：
+    """把上游错误转成客户可识别的响应。
 
-    - 上游 4xx（如 response_format=json_object 被上游拒绝）→ 同码透传，
-      并保留上游 error 对象，客户端可识别"参数/格式不支持"并优雅降级；
-    - 上游 429 → 429 + Retry-After + 标准 rate_limit_error 结构，便于退避；
-    - 其余（5xx / 连接失败 / 熔断）→ **503** 网关兜底。
-      不用 502：502 的 body 在出网时容易被中间层（CDN/反代）替换成自己的
-      HTML 错误页，客户端就拿不到结构化 error；503 与 4xx/429 一样保留 JSON。
+    - FreeTier（形状/abuse）→ 503 `upstream_unavailable` 或 429
+      `rate_limit_error`，**绝不把上游 FreeTierError 文案透给客户端**；
+    - 上游 4xx（如 response_format=json_object 被上游拒绝）→ 同码透传；
+    - 上游 429 → 429 + Retry-After + 标准 rate_limit_error；
+    - 其余（5xx / 连接失败 / 熔断）→ 503 网关兜底（不用 502，避免 body
+      被中间层替换成 HTML）。
     """
     body = e.error_body or {}
-    msg = body.get("message") or str(e)
-    if e.status_code == 429:
+    freetier = _is_freetier_error(e)
+    msg = _public_error_message(e)
+    if freetier:
+        etype = ("rate_limit_error" if e.status_code == 429
+                 else "upstream_unavailable")
+    elif e.status_code == 429:
         etype = "rate_limit_error"
     elif isinstance(body.get("type"), str) and body.get("type"):
         etype = body["type"]
     elif e.status_code and 400 <= e.status_code < 500:
-        etype = "invalid_request_error"     # 上游拒的是请求本身
+        etype = "invalid_request_error"
     else:
-        etype = "upstream_error"            # 连接失败 / 熔断 / 上游 5xx，与 SSE 口径一致
+        etype = "upstream_error"
     error = {"message": msg, "type": etype, "param": None}
-    if body.get("code"):
+    if not freetier and body.get("code"):
         error["code"] = body["code"]
 
     if e.status_code == 429:
-        status = 429
         headers = {}
         if e.retry_after:
             headers["Retry-After"] = str(e.retry_after)
-        return JSONResponse(status_code=status, content={"error": error},
+        return JSONResponse(status_code=429, content={"error": error},
                             headers=headers or None)
+    if freetier:
+        return JSONResponse(status_code=503, content={"error": error})
     if e.status_code and 400 <= e.status_code < 500:
         return JSONResponse(status_code=e.status_code, content={"error": error})
     headers = {"Retry-After": str(e.retry_after)} if e.retry_after else None

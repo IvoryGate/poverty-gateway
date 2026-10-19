@@ -2,6 +2,13 @@
 
 ## 当前进度
 
+**阶段 22 完成（对外错误收口 + Responses 非流式聚合）**
+> 网关不应把上游 FreeTier 文案透给客户端。新增 `freetier.py` 统识别新旧
+> abuse 文案；路由层把 FreeTier 一律收口成 503 `upstream_unavailable`
+> （429 时 `rate_limit_error`），不再暴露 `FreeTierError` / `OpenCode` 字样。
+> `/v1/responses` 非流式也改成内部流式 + `_ResponsesStreamCollector` 聚合，
+> 不再用 stream=false 撞 free 档形状校验。89 测试通过。**待重启网关生效。**
+
 **阶段 21 完成（免费 IP 策略调整：abuse 重罚 + 覆盖率优先）**
 > 上游封禁加剧后，旧策略（per-IP zenhit + 单一 probe 模型 + abuse 仅当 DEAD）
 > 学不到"这个 IP 对某个模型 abuse"；GLM 这类模型反复失败，而 space-bunny 仍
@@ -86,6 +93,7 @@
 | 19 | free 档校验变更 + 探测修复 | [`19-freetier校验与请求头修复.md`](./19-freetier校验与请求头修复.md) | ✅ |
 | 20 | 首字节超时 + in-flight 泄漏修复 | [`20-首字节超时与在途泄漏修复.md`](./20-首字节超时与在途泄漏修复.md) | ✅ |
 | 21 | 免费 IP 策略调整（abuse 重罚 + 覆盖率优先） | [`21-免费IP策略调整.md`](./21-免费IP策略调整.md) | ✅ |
+| 22 | 对外错误收口 + Responses 非流式聚合 | [`22-对外错误收口与Responses聚合.md`](./22-对外错误收口与Responses聚合.md) | ✅ |
 
 ---
 

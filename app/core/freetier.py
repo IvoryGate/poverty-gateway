@@ -30,3 +30,21 @@ def is_abuse_message(message: str) -> bool:
     if any(marker in text for marker in _SHAPE_MARKERS):
         return False
     return any(marker in text for marker in _ABUSE_MARKERS)
+
+
+def is_freetier_message(message: str) -> bool:
+    """是否是任何 FreeTier 相关错误（形状错误或 IP abuse）。
+
+    这类错误只应存在于网关内部：对外统一收口成 503 / upstream_unavailable，
+    不把 "OpenCode free tier" 之类的上游文案透给客户端。
+    """
+    text = (message or "").lower()
+    return any(marker in text for marker in (
+        "freetiererror",
+        "free tier",
+        "free models aren't available",
+        "free models are not available",
+        "abusive traffic",
+        "detect abuse",
+        "from within opencode",
+    ))
